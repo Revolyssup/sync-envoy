@@ -10,10 +10,10 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"sync-envoy/pkg/diff"
-	"sync-envoy/pkg/k8s"
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/diff"
+	"github.com/revolyssup/sync-envoy/pkg/k8s"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // XCPFileUpdater writes XCP CR state to xcpconfigs/ and maintains

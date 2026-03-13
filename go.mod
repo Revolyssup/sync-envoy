@@ -1,4 +1,4 @@
-module sync-envoy
+module github.com/revolyssup/sync-envoy
 
 go 1.25.0
 

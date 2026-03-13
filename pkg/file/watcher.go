@@ -10,8 +10,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // DesiredFileWatcher watches for _desired.yaml files in istioconfigs/.

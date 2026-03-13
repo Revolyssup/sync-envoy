@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // EnvoyWatcher watches Envoy sidecar configurations.

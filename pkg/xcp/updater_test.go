@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 func TestXCPFileUpdater_WriteNamespaced(t *testing.T) {

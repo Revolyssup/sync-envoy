@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"sync-envoy/pkg/diff"
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/diff"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"

@@ -9,10 +9,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"sync-envoy/pkg/correlation"
-	"sync-envoy/pkg/diff"
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/correlation"
+	"github.com/revolyssup/sync-envoy/pkg/diff"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // PodLister returns pod names in a namespace matching the given label selector.

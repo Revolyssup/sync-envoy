@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 func TestDesiredFileWatcher_AutoRename(t *testing.T) {

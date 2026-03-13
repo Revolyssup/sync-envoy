@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // Provider composes a Watcher and an Updater into a single runnable unit.

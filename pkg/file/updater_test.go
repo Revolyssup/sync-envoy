@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"sync-envoy/pkg/correlation"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/correlation"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // mockPodLister implements PodLister for tests.

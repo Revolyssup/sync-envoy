@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 	"google.golang.org/grpc"

@@ -10,12 +10,12 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"sync-envoy/pkg/envoy"
-	"sync-envoy/pkg/file"
-	"sync-envoy/pkg/k8s"
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/provider"
-	"sync-envoy/pkg/xcp"
+	"github.com/revolyssup/sync-envoy/pkg/envoy"
+	"github.com/revolyssup/sync-envoy/pkg/file"
+	"github.com/revolyssup/sync-envoy/pkg/k8s"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/provider"
+	"github.com/revolyssup/sync-envoy/pkg/xcp"
 )
 
 var (

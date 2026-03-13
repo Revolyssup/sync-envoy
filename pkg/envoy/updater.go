@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"sync-envoy/pkg/correlation"
-	"sync-envoy/pkg/diff"
-	"sync-envoy/pkg/logging"
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/correlation"
+	"github.com/revolyssup/sync-envoy/pkg/diff"
+	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // FileUpdater writes Envoy configuration JSON files to the envoyconfigs directory.

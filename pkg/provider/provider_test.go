@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"sync-envoy/pkg/types"
+	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
 // mockWatcher implements types.Watcher for testing.
