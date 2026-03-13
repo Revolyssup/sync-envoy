@@ -15,6 +15,7 @@ import (
 	"sync-envoy/pkg/k8s"
 	"sync-envoy/pkg/logging"
 	"sync-envoy/pkg/provider"
+	"sync-envoy/pkg/xcp"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 	providerFilter   string
 	csdsAddress      string
 	istioconfigsPath = "istioconfigs"
+	xcpconfigsPath   = "xcpconfigs"
 )
 
 const pidFile = "/tmp/sync-envoy.pid"
@@ -42,6 +44,7 @@ func main() {
 			}
 			os.MkdirAll(dir, 0755)
 			os.MkdirAll(istioconfigsPath, 0755)
+			os.MkdirAll(xcpconfigsPath, 0755)
 		},
 	}
 
@@ -49,7 +52,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "Namespace filter")
 	rootCmd.PersistentFlags().StringVarP(&workloadSelector, "workload-selector", "w", "", "Workload selector (e.g., app=httpbin)")
 	rootCmd.PersistentFlags().StringVar(&logLevelStr, "log-level", "info", "Log level: debug, info, warn, error")
-	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,file,envoy")
+	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,file,envoy,xcp,xcp-file")
 	rootCmd.PersistentFlags().StringVar(&csdsAddress, "csds-address", "", "istiod gRPC address for CSDS streaming (e.g., localhost:15010). If empty, falls back to admin/istioctl polling")
 
 	startCmd := &cobra.Command{
@@ -98,6 +101,7 @@ func runStart(cmd *cobra.Command, args []string) {
 	logging.Info("Starting sync-envoy with configuration:")
 	logging.Info("  envoy dir: %s", dir)
 	logging.Info("  istioconfigs dir: %s", istioconfigsPath)
+	logging.Info("  xcpconfigs dir: %s", xcpconfigsPath)
 	logging.Info("  namespace: %s", namespace)
 	logging.Info("  workload selector: %s", workloadSelector)
 	logging.Info("  provider filter: %s", providerFilter)
@@ -137,6 +141,20 @@ func runStart(cmd *cobra.Command, args []string) {
 		"envoy",
 		envoy.NewEnvoyWatcher(namespace, workloadSelector, csdsAddress),
 		envoy.NewFileUpdater(dir, "last_updated").WithIstioconfigsPath(istioconfigsPath),
+	))
+
+	// XCP provider: watches XCP CRDs, writes _current.yaml + XCP→Istio correlation
+	registry.Register(provider.New(
+		"xcp",
+		xcp.NewXCPWatcher(clients),
+		xcp.NewXCPFileUpdater(xcpconfigsPath, istioconfigsPath, clients),
+	))
+
+	// XCP file provider: watches _desired.yaml in xcpconfigs/, applies to K8s cluster
+	registry.Register(provider.New(
+		"xcp-file",
+		file.NewDesiredFileWatcher(xcpconfigsPath),
+		k8s.NewCRUpdater(clients),
 	))
 
 	// Resolve which providers to run
@@ -232,6 +250,21 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("           Ignores %slast_updated%s when diffing (timestamp noise suppressed)", bold, reset)
 	p("           Writes %scorrelation.json%s alongside each pod's configs", bold, reset)
 
+	p("")
+	p("  %s[xcp]%s  XCP CRs → files + XCP↔Istio correlation", bold+green, reset)
+	p("  %sWatcher%s  Dynamic informers for XCP CRD types across 6 API groups:", bold, reset)
+	p("           %sxcp.tetrate.io, traffic.xcp.tetrate.io, gateway.xcp.tetrate.io,%s", dim, reset)
+	p("           %ssecurity.xcp.tetrate.io, extension.xcp.tetrate.io, istiointernal.xcp.tetrate.io%s", dim, reset)
+	p("  %sUpdater%s  Writes  %sxcpconfigs/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
+	p("           Correlates XCP → Istio via hierarchy labels + name matching")
+	p("           Writes %scorrelation.json%s in xcpconfigs (forward) and", bold, reset)
+	p("           %sxcp-correlation.json%s in istioconfigs (reverse)", bold, reset)
+
+	p("")
+	p("  %s[xcp-file]%s  _desired.yaml → K8s cluster (for XCP resources)", bold+green, reset)
+	p("  %sWatcher%s  fsnotify watches %sxcpconfigs/%s recursively", bold, reset, yellow, reset)
+	p("  %sUpdater%s  Reuses the same k8s CRUpdater as [file] provider", bold, reset)
+
 	hr("FILE STRUCTURE")
 	p("")
 	p("  %sistioconfigs/%s", yellow, reset)
@@ -249,6 +282,13 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("      %svirtualservice-correlation.json%s    ← VSs that shaped routes", bold, reset)
 	p("      %sgateway-correlation.json%s            ← Gateways in listener config", bold, reset)
 	p("      %s<kind>-correlation.json%s             ← policy CRs matched by selector", bold, reset)
+	p("")
+	p("  %sxcpconfigs/%s", yellow, reset)
+	p("  %s  <namespace>/%s", dim, reset)
+	p("  %s    <kind>/%s", dim, reset)
+	p("      <name>%s_current.yaml%s  ← live XCP CR state     %s(written by xcp provider)%s", green, reset, dim, reset)
+	p("      <name>%s_desired.yaml%s  ← your proposed change  %s(edit this)%s", blue, reset, dim, reset)
+	p("      %scorrelation.json%s      ← XCP resource → produced Istio resources", bold, reset)
 
 	hr("CORRELATION")
 	p("")
@@ -293,7 +333,7 @@ func runHow(cmd *cobra.Command, args []string) {
 }
 
 func runCleanup(cmd *cobra.Command, args []string) {
-	dirs := []string{"envoyconfigs", istioconfigsPath}
+	dirs := []string{"envoyconfigs", istioconfigsPath, xcpconfigsPath}
 	for _, d := range dirs {
 		if err := os.RemoveAll(d); err != nil {
 			logging.Warn("Failed to remove %s: %v", d, err)
