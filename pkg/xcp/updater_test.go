@@ -11,9 +11,8 @@ import (
 
 func TestXCPFileUpdater_WriteNamespaced(t *testing.T) {
 	xcpDir := t.TempDir()
-	istioDir := t.TempDir()
 
-	updater := NewXCPFileUpdater(xcpDir, istioDir, nil)
+	updater := NewXCPFileUpdater(xcpDir, nil, nil)
 
 	event := types.Event{
 		Type:    types.EventAdd,
@@ -42,8 +41,7 @@ func TestXCPFileUpdater_WriteNamespaced(t *testing.T) {
 
 func TestXCPFileUpdater_SkipNoDiff(t *testing.T) {
 	xcpDir := t.TempDir()
-	istioDir := t.TempDir()
-	updater := NewXCPFileUpdater(xcpDir, istioDir, nil)
+	updater := NewXCPFileUpdater(xcpDir, nil, nil)
 
 	event := types.Event{
 		Type:    types.EventUpdate,
@@ -73,8 +71,7 @@ func TestXCPFileUpdater_SkipNoDiff(t *testing.T) {
 
 func TestXCPFileUpdater_Delete(t *testing.T) {
 	xcpDir := t.TempDir()
-	istioDir := t.TempDir()
-	updater := NewXCPFileUpdater(xcpDir, istioDir, nil)
+	updater := NewXCPFileUpdater(xcpDir, nil, nil)
 
 	// Write first
 	addEvent := types.Event{
@@ -123,14 +120,13 @@ func TestBuildLabelSelector(t *testing.T) {
 	if sel == "" {
 		t.Fatal("expected non-empty selector")
 	}
-	// Should contain both XCP hierarchy labels, not the unrelated one
-	if !contains(sel, "xcp.tetrate.io/workspace=ws1") {
+	if !containsSubstring(sel, "xcp.tetrate.io/workspace=ws1") {
 		t.Errorf("selector missing workspace: %s", sel)
 	}
-	if !contains(sel, "xcp.tetrate.io/trafficGroup=tg1") {
+	if !containsSubstring(sel, "xcp.tetrate.io/trafficGroup=tg1") {
 		t.Errorf("selector missing trafficGroup: %s", sel)
 	}
-	if contains(sel, "unrelated") {
+	if containsSubstring(sel, "unrelated") {
 		t.Errorf("selector should not contain unrelated: %s", sel)
 	}
 }
@@ -140,10 +136,6 @@ func TestBuildLabelSelector_Empty(t *testing.T) {
 	if sel != "" {
 		t.Errorf("expected empty selector for non-XCP labels, got %q", sel)
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
 }
 
 func containsSubstring(s, sub string) bool {

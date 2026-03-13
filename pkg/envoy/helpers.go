@@ -1,6 +1,7 @@
 package envoy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -41,16 +42,16 @@ type TimestampedConfig struct {
 	Config      json.RawMessage `json:"config"`
 }
 
-// GetPods returns pods matching the given namespace and label selector.
-func GetPods(namespace, selector string) ([]PodInfo, error) {
+// GetPods returns pods matching the given label selector across all namespaces.
+func GetPods(ctx context.Context, selector string) ([]PodInfo, error) {
 	args := []string{
-		"get", "pods", "-n", namespace,
+		"get", "pods", "--all-namespaces",
 		"-o", `jsonpath={range .items[*]}{.metadata.name}{" "}{.metadata.namespace}{"\n"}{end}`,
 	}
 	if selector != "" {
 		args = append(args, "-l", selector)
 	}
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("kubectl failed: %v\n%s", err, out)
@@ -70,15 +71,15 @@ func GetPods(namespace, selector string) ([]PodInfo, error) {
 }
 
 // RunIstioctlProxyConfig executes istioctl proxy-config for a pod.
-func RunIstioctlProxyConfig(pod, namespace, typ string) ([]byte, error) {
-	cmd := exec.Command("istioctl", "proxy-config", typ, pod, "-n", namespace, "-o", "json")
+func RunIstioctlProxyConfig(ctx context.Context, pod, namespace, typ string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "istioctl", "proxy-config", typ, pod, "-n", namespace, "-o", "json")
 	return cmd.CombinedOutput()
 }
 
 // FetchAdminConfigDump fetches the Envoy config dump via kubectl exec.
-func FetchAdminConfigDump(podName, namespace string) ([]byte, error) {
-	cmd := exec.Command(
-		"kubectl", "exec", podName, "-n", namespace, "-c", "istio-proxy",
+func FetchAdminConfigDump(ctx context.Context, podName, namespace string) ([]byte, error) {
+	cmd := exec.CommandContext(
+		ctx, "kubectl", "exec", podName, "-n", namespace, "-c", "istio-proxy",
 		"--", "curl", "-s", "http://localhost:15000/config_dump",
 	)
 	return cmd.CombinedOutput()

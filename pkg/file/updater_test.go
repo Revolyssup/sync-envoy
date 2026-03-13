@@ -2,24 +2,14 @@ package file
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/revolyssup/sync-envoy/pkg/correlation"
+	"github.com/revolyssup/sync-envoy/pkg/topology"
 	"github.com/revolyssup/sync-envoy/pkg/types"
 )
-
-// mockPodLister implements PodLister for tests.
-type mockPodLister struct {
-	pods []string
-	err  error
-}
-
-func (m *mockPodLister) ListPodNames(_ context.Context, _ string, _ map[string]string) ([]string, error) {
-	return m.pods, m.err
-}
 
 func TestCurrentFileUpdater_WriteNamespaced(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -113,139 +103,6 @@ func TestCurrentFileUpdater_SkipNoDiff(t *testing.T) {
 	}
 }
 
-func TestSelectorCorrelation_WritesCorrelationJSON(t *testing.T) {
-	istioDir := t.TempDir()
-	envoyDir := t.TempDir()
-
-	// Pre-create a listener.json so ExtractListenerNamesFromFile has data to read.
-	podDir := filepath.Join(envoyDir, "default", "httpbin-abc123")
-	os.MkdirAll(podDir, 0755)
-	listenerJSON := `{
-		"pod_name": "httpbin-abc123", "namespace": "default", "config_type": "listener",
-		"config": {"dynamic_listeners": [
-			{"name": "0.0.0.0_8080"},
-			{"name": "0.0.0.0_15006"}
-		]}
-	}`
-	os.WriteFile(filepath.Join(podDir, "listener.json"), []byte(listenerJSON), 0644)
-
-	lister := &mockPodLister{pods: []string{"httpbin-abc123"}}
-	updater := NewCurrentFileUpdater(istioDir).WithSelectorCorrelation(lister, envoyDir)
-
-	yamlData := []byte(`apiVersion: security.istio.io/v1beta1
-kind: AuthorizationPolicy
-metadata:
-  name: deny-all
-  namespace: default
-spec:
-  selector:
-    matchLabels:
-      app: httpbin
-`)
-
-	event := types.Event{
-		Type:    types.EventAdd,
-		Key:     "default/authorizationpolicy/deny-all",
-		NewData: yamlData,
-		Metadata: map[string]string{
-			"kind":      "AuthorizationPolicy",
-			"name":      "deny-all",
-			"namespace": "default",
-		},
-	}
-
-	if err := updater.Update(context.Background(), event); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
-
-	// istioconfigs-side: istioconfigs/default/authorizationpolicy/correlation.json
-	istioCorrPath := filepath.Join(istioDir, "default", "authorizationpolicy", "correlation.json")
-	data, err := os.ReadFile(istioCorrPath)
-	if err != nil {
-		t.Fatalf("istioconfigs correlation.json not written: %v", err)
-	}
-	var corr correlation.IstioCorrelation
-	if err := json.Unmarshal(data, &corr); err != nil {
-		t.Fatalf("failed to parse istio correlation.json: %v", err)
-	}
-	entries, ok := corr["deny-all"]
-	if !ok || len(entries) == 0 {
-		t.Fatalf("expected entries for 'deny-all', got: %v", corr)
-	}
-	if entries[0].Pod != "httpbin-abc123" {
-		t.Errorf("expected pod httpbin-abc123, got %s", entries[0].Pod)
-	}
-	if entries[0].ConfigType != "listener" {
-		t.Errorf("expected config_type listener, got %s", entries[0].ConfigType)
-	}
-
-	// envoyconfigs-side: envoyconfigs/<ns>/<pod>/authorizationpolicy-correlation.json
-	envoyCorrPath := filepath.Join(envoyDir, "default", "httpbin-abc123", "authorizationpolicy-correlation.json")
-	envoyData, err := os.ReadFile(envoyCorrPath)
-	if err != nil {
-		t.Fatalf("envoyconfigs authorizationpolicy-correlation.json not written: %v", err)
-	}
-	var pc correlation.PodCorrelation
-	if err := json.Unmarshal(envoyData, &pc); err != nil {
-		t.Fatalf("failed to parse pod correlation: %v", err)
-	}
-	refKey := "AuthorizationPolicy/default/deny-all"
-	affected, ok := pc.AffectedBy[refKey]
-	if !ok {
-		t.Fatalf("expected key %q in affected_by, got: %v", refKey, pc.AffectedBy)
-	}
-	if len(affected) != 2 {
-		t.Errorf("expected 2 affected listeners, got %d: %+v", len(affected), affected)
-	}
-	names := map[string]bool{}
-	for _, a := range affected {
-		names[a.Name] = true
-		if a.Type != "listener" {
-			t.Errorf("type: got %q, want listener", a.Type)
-		}
-	}
-	if !names["0.0.0.0_8080"] || !names["0.0.0.0_15006"] {
-		t.Errorf("missing listener names: %v", names)
-	}
-}
-
-func TestSelectorCorrelation_SkipsEmptySelector(t *testing.T) {
-	istioDir := t.TempDir()
-	envoyDir := t.TempDir()
-
-	lister := &mockPodLister{pods: []string{"should-not-appear"}}
-	updater := NewCurrentFileUpdater(istioDir).WithSelectorCorrelation(lister, envoyDir)
-
-	// No spec.selector.matchLabels → should skip correlation
-	yamlData := []byte(`apiVersion: security.istio.io/v1beta1
-kind: AuthorizationPolicy
-metadata:
-  name: allow-all
-  namespace: default
-spec: {}
-`)
-
-	event := types.Event{
-		Type:    types.EventAdd,
-		Key:     "default/authorizationpolicy/allow-all",
-		NewData: yamlData,
-		Metadata: map[string]string{
-			"kind":      "AuthorizationPolicy",
-			"name":      "allow-all",
-			"namespace": "default",
-		},
-	}
-
-	if err := updater.Update(context.Background(), event); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
-
-	envoyCorrPath := filepath.Join(envoyDir, "default", "should-not-appear", "authorizationpolicy-correlation.json")
-	if _, err := os.Stat(envoyCorrPath); !os.IsNotExist(err) {
-		t.Error("authorizationpolicy-correlation.json should not be written for empty selector")
-	}
-}
-
 func TestCurrentFileUpdater_Delete(t *testing.T) {
 	tmpDir := t.TempDir()
 	updater := NewCurrentFileUpdater(tmpDir)
@@ -282,5 +139,155 @@ func TestCurrentFileUpdater_Delete(t *testing.T) {
 	path := filepath.Join(tmpDir, "default", "virtualservice", "httpbin_current.yaml")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Error("expected file to be deleted")
+	}
+}
+
+func TestCurrentFileUpdater_WritesTopology(t *testing.T) {
+	tmpDir := t.TempDir()
+	topo := topology.NewFile(tmpDir, "Istio Resource Topology")
+	updater := NewCurrentFileUpdater(tmpDir).WithTopology(topo)
+
+	// Add a Gateway
+	gwYAML := []byte(`apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: my-gw
+  namespace: default
+  labels:
+    xcp.tetrate.io/workspace: ws1
+    xcp.tetrate.io/gatewayGroup: gg1
+spec:
+  selector:
+    app: my-gateway
+  servers:
+  - hosts:
+    - "*.example.com"
+    port:
+      number: 443
+      protocol: HTTPS
+`)
+	gwEvent := types.Event{
+		Type:    types.EventAdd,
+		Key:     "default/gateway/my-gw",
+		NewData: gwYAML,
+		Metadata: map[string]string{
+			"kind":      "Gateway",
+			"name":      "my-gw",
+			"namespace": "default",
+		},
+	}
+	if err := updater.Update(context.Background(), gwEvent); err != nil {
+		t.Fatalf("Gateway update failed: %v", err)
+	}
+
+	// Add a VirtualService
+	vsYAML := []byte(`apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: my-vs
+  namespace: default
+spec:
+  gateways:
+  - default/my-gw
+  hosts:
+  - app.example.com
+  http:
+  - route:
+    - destination:
+        host: app.default.svc.cluster.local
+        port:
+          number: 8080
+`)
+	vsEvent := types.Event{
+		Type:    types.EventAdd,
+		Key:     "default/virtualservice/my-vs",
+		NewData: vsYAML,
+		Metadata: map[string]string{
+			"kind":      "VirtualService",
+			"name":      "my-vs",
+			"namespace": "default",
+		},
+	}
+	if err := updater.Update(context.Background(), vsEvent); err != nil {
+		t.Fatalf("VirtualService update failed: %v", err)
+	}
+
+	// Check topology.md was written
+	topoPath := filepath.Join(tmpDir, "topology.md")
+	data, err := os.ReadFile(topoPath)
+	if err != nil {
+		t.Fatalf("topology.md not written: %v", err)
+	}
+
+	content := string(data)
+
+	// Check Gateway edges
+	if !strings.Contains(content, "Gateway/my-gw --[selector]--> app=my-gateway") {
+		t.Errorf("missing Gateway selector edge in topology:\n%s", content)
+	}
+	if !strings.Contains(content, "Gateway/my-gw --[serves]--> *.example.com:443/HTTPS") {
+		t.Errorf("missing Gateway serves edge in topology:\n%s", content)
+	}
+
+	// Check VirtualService edges
+	if !strings.Contains(content, "VirtualService/my-vs --[gateway]--> Gateway/default/my-gw") {
+		t.Errorf("missing VS gateway edge in topology:\n%s", content)
+	}
+	if !strings.Contains(content, "VirtualService/my-vs --[route]--> app.default.svc.cluster.local:8080") {
+		t.Errorf("missing VS route edge in topology:\n%s", content)
+	}
+
+	// Check XCP provenance
+	if !strings.Contains(content, "Gateway/my-gw --[managed by]--> Workspace/ws1 > GatewayGroup/gg1") {
+		t.Errorf("missing XCP provenance edge in topology:\n%s", content)
+	}
+}
+
+func TestCurrentFileUpdater_TopologyRemovedOnDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	topo := topology.NewFile(tmpDir, "Istio Resource Topology")
+	updater := NewCurrentFileUpdater(tmpDir).WithTopology(topo)
+
+	// Add a resource
+	event := types.Event{
+		Type: types.EventAdd,
+		Key:  "default/gateway/gw1",
+		NewData: []byte(`apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: gw1
+  namespace: default
+spec:
+  selector:
+    app: gw1
+`),
+		Metadata: map[string]string{
+			"kind":      "Gateway",
+			"name":      "gw1",
+			"namespace": "default",
+		},
+	}
+	updater.Update(context.Background(), event)
+
+	topoPath := filepath.Join(tmpDir, "topology.md")
+	if _, err := os.Stat(topoPath); os.IsNotExist(err) {
+		t.Fatal("topology.md should exist after add")
+	}
+
+	// Delete the resource
+	deleteEvent := types.Event{
+		Type: types.EventDelete,
+		Key:  "default/gateway/gw1",
+		Metadata: map[string]string{
+			"kind":      "Gateway",
+			"name":      "gw1",
+			"namespace": "default",
+		},
+	}
+	updater.Update(context.Background(), deleteEvent)
+
+	// topology.md should be removed when no edges remain
+	if _, err := os.Stat(topoPath); !os.IsNotExist(err) {
+		t.Error("topology.md should be removed when all resources are deleted")
 	}
 }

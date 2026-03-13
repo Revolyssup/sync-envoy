@@ -77,11 +77,6 @@ func (w *EnvoyWatcher) StreamCSDS(ctx context.Context, events chan<- types.Event
 				continue
 			}
 
-			// Filter by namespace if configured
-			if w.namespace != "" && namespace != w.namespace {
-				continue
-			}
-
 			for _, xdsConfig := range clientConfig.GetXdsConfig() {
 				configType := classifyXdsConfig(xdsConfig)
 				if configType == "" {
@@ -105,7 +100,8 @@ func (w *EnvoyWatcher) StreamCSDS(ctx context.Context, events chan<- types.Event
 				}
 				data, _ := json.MarshalIndent(tc, "", "  ")
 
-				events <- types.Event{
+				select {
+				case events <- types.Event{
 					Type:    types.EventUpdate,
 					Key:     key,
 					NewData: data,
@@ -114,6 +110,9 @@ func (w *EnvoyWatcher) StreamCSDS(ctx context.Context, events chan<- types.Event
 						"namespace":   namespace,
 						"config_type": configType,
 					},
+				}:
+				case <-ctx.Done():
+					return nil
 				}
 				w.mu.Lock()
 				w.lastTimestamps[key] = now

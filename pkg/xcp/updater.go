@@ -13,25 +13,33 @@ import (
 	"github.com/revolyssup/sync-envoy/pkg/diff"
 	"github.com/revolyssup/sync-envoy/pkg/k8s"
 	"github.com/revolyssup/sync-envoy/pkg/logging"
+	"github.com/revolyssup/sync-envoy/pkg/topology"
 	"github.com/revolyssup/sync-envoy/pkg/types"
 )
 
-// XCPFileUpdater writes XCP CR state to xcpconfigs/ and maintains
-// XCP↔Istio correlation files.
-type XCPFileUpdater struct {
-	xcpBasePath   string // e.g. "xcpconfigs"
-	istioBasePath string // e.g. "istioconfigs"
-	clients       *k8s.Clients
-	lastWritten   map[string][]byte
-	mu            sync.Mutex
+// istioRef identifies an Istio resource found via cluster query.
+type istioRef struct {
+	Kind      string
+	Name      string
+	Namespace string
 }
 
-func NewXCPFileUpdater(xcpBasePath, istioBasePath string, clients *k8s.Clients) *XCPFileUpdater {
+// XCPFileUpdater writes XCP CR state to xcpconfigs/ and maintains
+// XCP→Istio topology.
+type XCPFileUpdater struct {
+	xcpBasePath string
+	clients     *k8s.Clients
+	topology    *topology.File
+	lastWritten map[string][]byte
+	mu          sync.Mutex
+}
+
+func NewXCPFileUpdater(xcpBasePath string, clients *k8s.Clients, topo *topology.File) *XCPFileUpdater {
 	return &XCPFileUpdater{
-		xcpBasePath:   xcpBasePath,
-		istioBasePath: istioBasePath,
-		clients:       clients,
-		lastWritten:   make(map[string][]byte),
+		xcpBasePath: xcpBasePath,
+		clients:     clients,
+		topology:    topo,
+		lastWritten: make(map[string][]byte),
 	}
 }
 
@@ -58,7 +66,10 @@ func (u *XCPFileUpdater) Update(ctx context.Context, event types.Event) error {
 			return err
 		}
 		logging.Debug("Deleted XCP file: %s", path)
-		RemoveXCPCorrelation(u.xcpBasePath, ns, kind, name)
+
+		if u.topology != nil {
+			u.topology.Remove(ns, kind, name)
+		}
 		return nil
 	}
 
@@ -87,17 +98,17 @@ func (u *XCPFileUpdater) Update(ctx context.Context, event types.Event) error {
 
 	logging.Debug("Written XCP file: %s", path)
 
-	// Run XCP→Istio correlation (requires k8s clients for label/name matching)
-	if u.clients != nil {
-		u.updateCorrelation(ctx, kind, name, ns, event.Metadata)
+	// Update XCP→Istio topology
+	if u.clients != nil && u.topology != nil {
+		u.updateTopology(ctx, kind, name, ns, event.Metadata)
 	}
 
 	return nil
 }
 
-// updateCorrelation finds Istio resources produced by this XCP resource
-// and writes bidirectional correlation files.
-func (u *XCPFileUpdater) updateCorrelation(ctx context.Context, kind, name, ns string, metadata map[string]string) {
+// updateTopology finds Istio resources produced by this XCP resource
+// and writes the XCP→Istio topology.
+func (u *XCPFileUpdater) updateTopology(ctx context.Context, kind, name, ns string, metadata map[string]string) {
 	istioKinds, ok := XCPToIstioMapping[kind]
 	if !ok {
 		return
@@ -109,68 +120,50 @@ func (u *XCPFileUpdater) updateCorrelation(ctx context.Context, kind, name, ns s
 		json.Unmarshal([]byte(labelsJSON), &xcpLabels)
 	}
 
-	// Build the XCP source ref for reverse correlation.
-	xcpRef := XCPResourceRef{
-		Kind:      metadata["kind"], // original case
-		Name:      name,
-		Namespace: ns,
-	}
-	if xcpLabels != nil {
-		xcpRef.Workspace = xcpLabels["xcp.tetrate.io/workspace"]
-		for _, lbl := range []string{"xcp.tetrate.io/trafficGroup", "xcp.tetrate.io/securityGroup", "xcp.tetrate.io/gatewayGroup"} {
-			if v, ok := xcpLabels[lbl]; ok {
-				xcpRef.Group = v
-				break
-			}
-		}
-	}
+	from := metadata["kind"] + "/" + name // original case, e.g. "IngressGateway/e2e-test-gw"
 
-	var allIstioRefs []IstioOutputRef
+	var edges []topology.Edge
 
 	for _, istioKind := range istioKinds {
 		refs := u.findIstioResources(ctx, istioKind, name, ns, xcpLabels)
-		allIstioRefs = append(allIstioRefs, refs...)
-	}
-
-	// Write forward correlation: xcpconfigs/<ns>/<kind>/correlation.json
-	if err := WriteXCPCorrelation(u.xcpBasePath, ns, kind, name, allIstioRefs); err != nil {
-		logging.Errorf("XCP correlation: failed to write forward for %s/%s/%s: %v", ns, kind, name, err)
-	}
-
-	// Write reverse correlation: istioconfigs/<ns>/<istioKind>/xcp-correlation.json
-	for _, ref := range allIstioRefs {
-		if err := WriteXCPReverseCorrelation(u.istioBasePath, ref, xcpRef); err != nil {
-			logging.Errorf("XCP correlation: failed to write reverse for %s/%s: %v", ref.Kind, ref.Name, err)
+		for _, ref := range refs {
+			target := ref.Kind + "/" + ref.Name
+			if ref.Namespace != "" && ref.Namespace != ns {
+				target += " (" + ref.Namespace + ")"
+			}
+			edges = append(edges, topology.Edge{From: from, To: target})
 		}
 	}
 
-	if len(allIstioRefs) > 0 {
-		logging.Debug("XCP correlation written for %s/%s/%s: %d Istio resources", ns, kind, name, len(allIstioRefs))
+	u.topology.Set(ns, kind, name, edges)
+
+	if len(edges) > 0 {
+		logging.Debug("XCP topology written for %s/%s/%s: %d Istio resources", ns, kind, name, len(edges))
 	}
 }
 
 // findIstioResources looks for Istio resources of istioKind in the same namespace
-// that were produced by the XCP resource. It tries label-based matching first,
-// then falls back to name-based convention.
-func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpName, ns string, xcpLabels map[string]string) []IstioOutputRef {
+// that were produced by the XCP resource.
+func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpName, ns string, xcpLabels map[string]string) []istioRef {
 	gvr, ok := IstioGVRForKind(istioKind)
 	if !ok {
 		return nil
 	}
 
 	// Strategy 1: Label-based matching using XCP hierarchy labels.
+	// Search across all namespaces — generated Istio resources may live in a
+	// different namespace than the XCP resource (e.g. XCP in xcp-system, Istio in echo).
 	if len(xcpLabels) > 0 {
 		selector := buildLabelSelector(xcpLabels)
 		if selector != "" {
-			list, err := u.clients.Dynamic.Resource(gvr).Namespace(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
+			list, err := u.clients.Dynamic.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, metav1.ListOptions{LabelSelector: selector})
 			if err == nil && len(list.Items) > 0 {
-				refs := make([]IstioOutputRef, 0, len(list.Items))
+				refs := make([]istioRef, 0, len(list.Items))
 				for _, item := range list.Items {
-					refs = append(refs, IstioOutputRef{
+					refs = append(refs, istioRef{
 						Kind:      istioKind,
 						Name:      item.GetName(),
 						Namespace: item.GetNamespace(),
-						FilePath:  istioFilePath(u.istioBasePath, item.GetNamespace(), istioKind, item.GetName()),
 					})
 				}
 				return refs
@@ -181,11 +174,10 @@ func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpN
 	// Strategy 2: Name-based convention (XCP resource and Istio resource share the same name).
 	_, err := u.clients.Dynamic.Resource(gvr).Namespace(ns).Get(ctx, xcpName, metav1.GetOptions{})
 	if err == nil {
-		return []IstioOutputRef{{
+		return []istioRef{{
 			Kind:      istioKind,
 			Name:      xcpName,
 			Namespace: ns,
-			FilePath:  istioFilePath(u.istioBasePath, ns, istioKind, xcpName),
 		}}
 	}
 
@@ -201,8 +193,4 @@ func buildLabelSelector(labels map[string]string) string {
 		}
 	}
 	return strings.Join(parts, ",")
-}
-
-func istioFilePath(basePath, ns, kind, name string) string {
-	return filepath.Join(basePath, ns, strings.ToLower(kind), name+"_current.yaml")
 }

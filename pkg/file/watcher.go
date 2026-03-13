@@ -60,6 +60,9 @@ func (w *DesiredFileWatcher) Watch(ctx context.Context, events chan<- types.Even
 	for {
 		select {
 		case <-ctx.Done():
+			if debounceTimer != nil {
+				debounceTimer.Stop()
+			}
 			return nil
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -81,7 +84,7 @@ func (w *DesiredFileWatcher) Watch(ctx context.Context, events chan<- types.Even
 							return nil
 						}
 						if strings.HasSuffix(p, "_desired.yaml") {
-							w.emitEvent(fsnotify.Event{Name: p, Op: fsnotify.Create}, events)
+							w.emitEvent(ctx, fsnotify.Event{Name: p, Op: fsnotify.Create}, events)
 						}
 						return nil
 					})
@@ -130,7 +133,7 @@ func (w *DesiredFileWatcher) Watch(ctx context.Context, events chan<- types.Even
 			}
 			debounceTimer = time.AfterFunc(debounceDelay, func() {
 				for _, pe := range pending {
-					w.emitEvent(pe, events)
+					w.emitEvent(ctx, pe, events)
 				}
 			})
 			// Clear pending after scheduling
@@ -145,7 +148,7 @@ func (w *DesiredFileWatcher) Watch(ctx context.Context, events chan<- types.Even
 	}
 }
 
-func (w *DesiredFileWatcher) emitEvent(event fsnotify.Event, events chan<- types.Event) {
+func (w *DesiredFileWatcher) emitEvent(ctx context.Context, event fsnotify.Event, events chan<- types.Event) {
 	data, err := os.ReadFile(event.Name)
 	if err != nil {
 		logging.Errorf("Failed to read %s: %v", event.Name, err)
@@ -158,7 +161,8 @@ func (w *DesiredFileWatcher) emitEvent(event fsnotify.Event, events chan<- types
 		return
 	}
 
-	events <- types.Event{
+	select {
+	case events <- types.Event{
 		Type:    types.EventUpdate,
 		Key:     relPath,
 		NewData: data,
@@ -166,5 +170,7 @@ func (w *DesiredFileWatcher) emitEvent(event fsnotify.Event, events chan<- types
 			"file_path": event.Name,
 			"rel_path":  relPath,
 		},
+	}:
+	case <-ctx.Done():
 	}
 }

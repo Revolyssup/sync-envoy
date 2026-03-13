@@ -17,16 +17,14 @@ import (
 // 2. Admin endpoint polling via kubectl exec
 // 3. istioctl proxy-config polling (final fallback)
 type EnvoyWatcher struct {
-	namespace        string
 	workloadSelector string
 	csdsAddress      string // istiod gRPC address for CSDS (e.g., "localhost:15010")
 	lastTimestamps   map[string]time.Time
 	mu               sync.Mutex
 }
 
-func NewEnvoyWatcher(namespace, workloadSelector, csdsAddress string) *EnvoyWatcher {
+func NewEnvoyWatcher(workloadSelector, csdsAddress string) *EnvoyWatcher {
 	return &EnvoyWatcher{
-		namespace:        namespace,
 		workloadSelector: workloadSelector,
 		csdsAddress:      csdsAddress,
 		lastTimestamps:   make(map[string]time.Time),
@@ -64,7 +62,7 @@ func (w *EnvoyWatcher) Watch(ctx context.Context, events chan<- types.Event) err
 // watchAdminEndpoint polls each sidecar's admin /config_dump endpoint.
 func (w *EnvoyWatcher) watchAdminEndpoint(ctx context.Context, events chan<- types.Event) error {
 	// Quick test: try to reach the first pod's admin endpoint
-	pods, err := GetPods(w.namespace, w.workloadSelector)
+	pods, err := GetPods(ctx, w.workloadSelector)
 	if err != nil {
 		return fmt.Errorf("failed to list pods: %w", err)
 	}
@@ -72,9 +70,18 @@ func (w *EnvoyWatcher) watchAdminEndpoint(ctx context.Context, events chan<- typ
 		return fmt.Errorf("no pods found matching selector")
 	}
 
-	_, err = FetchAdminConfigDump(pods[0].Name, pods[0].Namespace)
-	if err != nil {
-		return fmt.Errorf("admin endpoint not reachable on %s/%s: %w", pods[0].Namespace, pods[0].Name, err)
+	reachable := false
+	for _, pod := range pods {
+		_, err = FetchAdminConfigDump(ctx, pod.Name, pod.Namespace)
+		if err == nil {
+			reachable = true
+			logging.Info("Admin endpoint reachable on %s/%s", pod.Namespace, pod.Name)
+			break
+		}
+		logging.Debug("Admin endpoint not reachable on %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+	if !reachable {
+		return fmt.Errorf("admin endpoint not reachable on any of %d pods", len(pods))
 	}
 
 	logging.Info("Admin endpoint reachable, starting polling")
@@ -87,7 +94,7 @@ func (w *EnvoyWatcher) watchAdminEndpoint(ctx context.Context, events chan<- typ
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			pods, err := GetPods(w.namespace, w.workloadSelector)
+			pods, err := GetPods(ctx, w.workloadSelector)
 			if err != nil {
 				logging.Errorf("Failed to list pods: %v", err)
 				continue
@@ -100,7 +107,7 @@ func (w *EnvoyWatcher) watchAdminEndpoint(ctx context.Context, events chan<- typ
 }
 
 func (w *EnvoyWatcher) fetchAndEmitAdminConfigs(ctx context.Context, pod PodInfo, events chan<- types.Event) {
-	dump, err := FetchAdminConfigDump(pod.Name, pod.Namespace)
+	dump, err := FetchAdminConfigDump(ctx, pod.Name, pod.Namespace)
 	if err != nil {
 		logging.Debug("Failed to fetch config_dump for %s/%s: %v", pod.Namespace, pod.Name, err)
 		return
@@ -124,7 +131,8 @@ func (w *EnvoyWatcher) fetchAndEmitAdminConfigs(ctx context.Context, pod PodInfo
 		}
 		data, _ := json.MarshalIndent(tc, "", "  ")
 
-		events <- types.Event{
+		select {
+		case events <- types.Event{
 			Type:    types.EventUpdate,
 			Key:     key,
 			NewData: data,
@@ -133,6 +141,9 @@ func (w *EnvoyWatcher) fetchAndEmitAdminConfigs(ctx context.Context, pod PodInfo
 				"namespace":   pod.Namespace,
 				"config_type": string(configType),
 			},
+		}:
+		case <-ctx.Done():
+			return
 		}
 
 		w.mu.Lock()
@@ -153,7 +164,7 @@ func (w *EnvoyWatcher) watchIstioctl(ctx context.Context, events chan<- types.Ev
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			pods, err := GetPods(w.namespace, w.workloadSelector)
+			pods, err := GetPods(ctx, w.workloadSelector)
 			if err != nil {
 				logging.Errorf("Failed to list pods: %v", err)
 				continue
@@ -164,9 +175,9 @@ func (w *EnvoyWatcher) watchIstioctl(ctx context.Context, events chan<- types.Ev
 				for _, configType := range AllConfigTypes {
 					key := fmt.Sprintf("%s/%s/%s", pod.Namespace, pod.Name, configType)
 
-					out, err := RunIstioctlProxyConfig(pod.Name, pod.Namespace, string(configType))
+					out, err := RunIstioctlProxyConfig(ctx, pod.Name, pod.Namespace, string(configType))
 					if err != nil {
-						// Many pods won't have sidecars, skip silently
+						logging.Debug("istioctl proxy-config %s %s/%s failed: %v", configType, pod.Namespace, pod.Name, err)
 						continue
 					}
 
@@ -179,7 +190,8 @@ func (w *EnvoyWatcher) watchIstioctl(ctx context.Context, events chan<- types.Ev
 					}
 					data, _ := json.MarshalIndent(tc, "", "  ")
 
-					events <- types.Event{
+					select {
+					case events <- types.Event{
 						Type:    types.EventUpdate,
 						Key:     key,
 						NewData: data,
@@ -188,6 +200,9 @@ func (w *EnvoyWatcher) watchIstioctl(ctx context.Context, events chan<- types.Ev
 							"namespace":   pod.Namespace,
 							"config_type": string(configType),
 						},
+					}:
+					case <-ctx.Done():
+						return nil
 					}
 
 					w.mu.Lock()

@@ -1,11 +1,16 @@
 package main
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -15,18 +20,19 @@ import (
 	"github.com/revolyssup/sync-envoy/pkg/k8s"
 	"github.com/revolyssup/sync-envoy/pkg/logging"
 	"github.com/revolyssup/sync-envoy/pkg/provider"
+	"github.com/revolyssup/sync-envoy/pkg/topology"
 	"github.com/revolyssup/sync-envoy/pkg/xcp"
 )
 
 var (
 	dir              string
-	namespace        string
 	workloadSelector string
 	logLevelStr      string
 	providerFilter   string
 	csdsAddress      string
 	istioconfigsPath = "istioconfigs"
 	xcpconfigsPath   = "xcpconfigs"
+	packName         string
 )
 
 const pidFile = "/tmp/sync-envoy.pid"
@@ -49,10 +55,9 @@ func main() {
 	}
 
 	rootCmd.PersistentFlags().StringVar(&dir, "dir", "envoyconfigs", "Directory to store Envoy configs")
-	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "Namespace filter")
 	rootCmd.PersistentFlags().StringVarP(&workloadSelector, "workload-selector", "w", "", "Workload selector (e.g., app=httpbin)")
 	rootCmd.PersistentFlags().StringVar(&logLevelStr, "log-level", "info", "Log level: debug, info, warn, error")
-	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,file,envoy,xcp,xcp-file")
+	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,istio-file,envoy,xcp,xcp-file")
 	rootCmd.PersistentFlags().StringVar(&csdsAddress, "csds-address", "", "istiod gRPC address for CSDS streaming (e.g., localhost:15010). If empty, falls back to admin/istioctl polling")
 
 	startCmd := &cobra.Command{
@@ -77,7 +82,21 @@ func main() {
 		Run:   runHow,
 	}
 
-	rootCmd.AddCommand(startCmd, stopCmd, cleanupCmd, howCmd)
+	packCmd := &cobra.Command{
+		Use:   "pack",
+		Short: "Pack envoyconfigs, istioconfigs and xcpconfigs into a tar.gz archive",
+		Run:   runPack,
+	}
+	packCmd.Flags().StringVar(&packName, "name", "packed-envoy-configs", "Name of the output tar.gz file (without extension)")
+
+	unpackCmd := &cobra.Command{
+		Use:   "unpack <tarfile>",
+		Short: "Unpack a tar.gz archive into envoyconfigs, istioconfigs and xcpconfigs",
+		Args:  cobra.ExactArgs(1),
+		Run:   runUnpack,
+	}
+
+	rootCmd.AddCommand(startCmd, stopCmd, cleanupCmd, howCmd, packCmd, unpackCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -102,7 +121,6 @@ func runStart(cmd *cobra.Command, args []string) {
 	logging.Info("  envoy dir: %s", dir)
 	logging.Info("  istioconfigs dir: %s", istioconfigsPath)
 	logging.Info("  xcpconfigs dir: %s", xcpconfigsPath)
-	logging.Info("  namespace: %s", namespace)
 	logging.Info("  workload selector: %s", workloadSelector)
 	logging.Info("  provider filter: %s", providerFilter)
 	logging.Info("  csds address: %s", csdsAddress)
@@ -122,16 +140,20 @@ func runStart(cmd *cobra.Command, args []string) {
 	// Build provider registry
 	registry := provider.NewRegistry()
 
-	// Kubernetes provider: watches K8s CRs, writes _current.yaml files
+	// Create topology writers
+	istioTopology := topology.NewFile(istioconfigsPath, "Istio Resource Topology")
+	xcpTopology := topology.NewFile(xcpconfigsPath, "XCP → Istio Resource Topology")
+
+	// Kubernetes provider: watches K8s CRs, writes _current.yaml files + topology
 	registry.Register(provider.New(
 		"kubernetes",
 		k8s.NewCRWatcher(clients),
-		file.NewCurrentFileUpdater(istioconfigsPath).WithSelectorCorrelation(clients, dir),
+		file.NewCurrentFileUpdater(istioconfigsPath).WithTopology(istioTopology),
 	))
 
-	// File provider: watches _desired.yaml files, applies to K8s cluster
+	// Istio-file provider: watches _desired.yaml files in istioconfigs/, applies to K8s cluster
 	registry.Register(provider.New(
-		"file",
+		"istio-file",
 		file.NewDesiredFileWatcher(istioconfigsPath),
 		k8s.NewCRUpdater(clients),
 	))
@@ -139,15 +161,15 @@ func runStart(cmd *cobra.Command, args []string) {
 	// Envoy provider: reads envoy configs, writes JSON files
 	registry.Register(provider.New(
 		"envoy",
-		envoy.NewEnvoyWatcher(namespace, workloadSelector, csdsAddress),
-		envoy.NewFileUpdater(dir, "last_updated").WithIstioconfigsPath(istioconfigsPath),
+		envoy.NewEnvoyWatcher(workloadSelector, csdsAddress),
+		envoy.NewFileUpdater(dir, "last_updated"),
 	))
 
-	// XCP provider: watches XCP CRDs, writes _current.yaml + XCP→Istio correlation
+	// XCP provider: watches XCP CRDs, writes _current.yaml + XCP→Istio topology
 	registry.Register(provider.New(
 		"xcp",
 		xcp.NewXCPWatcher(clients),
-		xcp.NewXCPFileUpdater(xcpconfigsPath, istioconfigsPath, clients),
+		xcp.NewXCPFileUpdater(xcpconfigsPath, clients, xcpTopology),
 	))
 
 	// XCP file provider: watches _desired.yaml in xcpconfigs/, applies to K8s cluster
@@ -161,6 +183,26 @@ func runStart(cmd *cobra.Command, args []string) {
 	providers, err := registry.Get(providerFilter)
 	if err != nil {
 		log.Fatalf("Failed to resolve providers: %v", err)
+	}
+
+	// xcp-file and istio-file are mutually exclusive: when xcp-file is active,
+	// xcpconfigs/ is the source of truth for desired state, so istio-file is disabled.
+	xcpFileActive := false
+	for _, p := range providers {
+		if p.Name() == "xcp-file" {
+			xcpFileActive = true
+			break
+		}
+	}
+	if xcpFileActive {
+		logging.Warn("xcp-file provider is active: istio-file provider disabled (source of truth is xcpconfigs/)")
+		filtered := providers[:0]
+		for _, p := range providers {
+			if p.Name() != "istio-file" {
+				filtered = append(filtered, p)
+			}
+		}
+		providers = filtered
 	}
 
 	logging.Info("Running %d provider(s)", len(providers))
@@ -223,7 +265,7 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("           Skips write when content is unchanged (LCS diff check)")
 
 	p("")
-	p("  %s[file]%s  _desired.yaml → K8s cluster", bold+green, reset)
+	p("  %s[istio-file]%s  _desired.yaml → K8s cluster", bold+green, reset)
 	p("  %sWatcher%s  fsnotify watches %sistioconfigs/%s recursively", bold, reset, yellow, reset)
 	p("           Plain .yaml files are %sauto-renamed%s to _desired.yaml", bold, reset)
 	p("           _current.yaml files are ignored")
@@ -248,17 +290,15 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("  %sUpdater%s  Writes  %senvoyconfigs/<ns>/<pod>/<type>.json%s", bold, reset, yellow, reset)
 	p("           JSON includes: last_updated, pod_name, namespace, config_type, config")
 	p("           Ignores %slast_updated%s when diffing (timestamp noise suppressed)", bold, reset)
-	p("           Writes %scorrelation.json%s alongside each pod's configs", bold, reset)
 
 	p("")
-	p("  %s[xcp]%s  XCP CRs → files + XCP↔Istio correlation", bold+green, reset)
+	p("  %s[xcp]%s  XCP CRs → files + XCP→Istio topology", bold+green, reset)
 	p("  %sWatcher%s  Dynamic informers for XCP CRD types across 6 API groups:", bold, reset)
 	p("           %sxcp.tetrate.io, traffic.xcp.tetrate.io, gateway.xcp.tetrate.io,%s", dim, reset)
 	p("           %ssecurity.xcp.tetrate.io, extension.xcp.tetrate.io, istiointernal.xcp.tetrate.io%s", dim, reset)
 	p("  %sUpdater%s  Writes  %sxcpconfigs/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
-	p("           Correlates XCP → Istio via hierarchy labels + name matching")
-	p("           Writes %scorrelation.json%s in xcpconfigs (forward) and", bold, reset)
-	p("           %sxcp-correlation.json%s in istioconfigs (reverse)", bold, reset)
+	p("           Maps XCP → Istio via hierarchy labels + name matching")
+	p("           Writes %sxcpconfigs/topology.md%s (XCP→Istio resource map)", bold, reset)
 
 	p("")
 	p("  %s[xcp-file]%s  _desired.yaml → K8s cluster (for XCP resources)", bold+green, reset)
@@ -272,37 +312,33 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("  %s    <kind>/%s", dim, reset)
 	p("      <name>%s_current.yaml%s  ← live cluster state  %s(written by kubernetes provider)%s", green, reset, dim, reset)
 	p("      <name>%s_desired.yaml%s  ← your proposed change %s(edit this)%s", blue, reset, dim, reset)
-	p("      %scorrelation.json%s      ← which Envoy configs reference this resource", bold, reset)
+	p("    %stopology.md%s              ← Istio resource relationship map", bold, reset)
 	p("")
 	p("  %senvoyconfigs/%s", yellow, reset)
 	p("  %s  <namespace>/%s", dim, reset)
 	p("  %s    <pod>/%s", dim, reset)
 	p("      cluster.json, listener.json, route.json, ...")
-	p("      %sdestinationrule-correlation.json%s   ← DRs that shaped clusters", bold, reset)
-	p("      %svirtualservice-correlation.json%s    ← VSs that shaped routes", bold, reset)
-	p("      %sgateway-correlation.json%s            ← Gateways in listener config", bold, reset)
-	p("      %s<kind>-correlation.json%s             ← policy CRs matched by selector", bold, reset)
 	p("")
 	p("  %sxcpconfigs/%s", yellow, reset)
 	p("  %s  <namespace>/%s", dim, reset)
 	p("  %s    <kind>/%s", dim, reset)
 	p("      <name>%s_current.yaml%s  ← live XCP CR state     %s(written by xcp provider)%s", green, reset, dim, reset)
 	p("      <name>%s_desired.yaml%s  ← your proposed change  %s(edit this)%s", blue, reset, dim, reset)
-	p("      %scorrelation.json%s      ← XCP resource → produced Istio resources", bold, reset)
+	p("    %stopology.md%s              ← XCP → Istio resource map", bold, reset)
 
-	hr("CORRELATION")
+	hr("TOPOLOGY")
 	p("")
-	p("  Pilot embeds %sistio.io/config%s metadata in each Envoy cluster,", bold, reset)
-	p("  pointing back to its source Istio CR (e.g. VirtualService, DestinationRule).")
+	p("  %sistioconfigs/topology.md%s  maps Istio resource relationships:", bold, reset)
+	p("    VirtualService → Gateway (spec.gateways)")
+	p("    VirtualService → destination hosts (spec.http[].route)")
+	p("    Gateway → workload selector (spec.selector)")
+	p("    DestinationRule → host + subsets")
+	p("    AuthorizationPolicy/PeerAuth → workload selector")
+	p("    ServiceEntry → hosts")
+	p("    + XCP provenance labels when present")
 	p("")
-	p("  Cluster name encodes the full relationship:")
-	p("    %soutbound|9080|v1|reviews.default.svc.cluster.local%s", yellow, reset)
-	p("                  %s^^  ^^^^^^^  ^^^^^^^%s", dim, reset)
-	p("                  %ssubset  service  namespace%s", dim, reset)
-	p("")
-	p("  Parsing names + filter_metadata builds a bidirectional index:")
-	p("    Istio CR   %s──→%s  affected Envoy files  %s(istioconfigs/.../correlation.json)%s", green, reset, dim, reset)
-	p("    Envoy pod  %s──→%s  source Istio CRs      %s(envoyconfigs/.../correlation.json)%s", green, reset, dim, reset)
+	p("  %sxcpconfigs/topology.md%s  maps XCP → Istio resources:", bold, reset)
+	p("    e.g. IngressGateway/foo %s──→%s Gateway/foo, VirtualService/vs-foo", green, reset)
 
 	hr("DIFF DETECTION")
 	p("")
@@ -319,12 +355,11 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("  2. Copy or edit it as %shttpbin_desired.yaml%s with your changes", bold, reset)
 	p("  3. Tool detects _desired.yaml → applies diff to cluster")
 	p("  4. K8s informer fires → %shttpbin_current.yaml%s is updated", yellow, reset)
-	p("  5. Check %scorrelation.json%s → click file path to see affected Envoy config", bold, reset)
+	p("  5. Check %stopology.md%s → see resource relationships at a glance", bold, reset)
 
 	hr("FLAGS")
 	p("")
-	p("  %s--provider%s           kubernetes,file,envoy  %s(default: all three)%s", bold, reset, dim, reset)
-	p("  %s--namespace%s      -n  target namespace       %s(default: default)%s", bold, reset, dim, reset)
+	p("  %s--provider%s           kubernetes,istio-file,envoy,xcp,xcp-file  %s(default: all)%s", bold, reset, dim, reset)
 	p("  %s--workload-selector%s  label selector         %s(e.g. app=httpbin)%s", bold, reset, dim, reset)
 	p("  %s--csds-address%s       istiod gRPC address    %s(e.g. localhost:15010)%s", bold, reset, dim, reset)
 	p("  %s--dir%s                envoy output dir       %s(default: envoyconfigs)%s", bold, reset, dim, reset)
@@ -341,4 +376,114 @@ func runCleanup(cmd *cobra.Command, args []string) {
 			logging.Info("Removed %s", d)
 		}
 	}
+}
+
+func runPack(cmd *cobra.Command, args []string) {
+	outFile := packName + ".tar.gz"
+	f, err := os.Create(outFile)
+	if err != nil {
+		log.Fatalf("Failed to create archive %s: %v", outFile, err)
+	}
+	defer f.Close()
+
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+
+	dirs := []string{dir, istioconfigsPath, xcpconfigsPath}
+	for _, d := range dirs {
+		if _, err := os.Stat(d); os.IsNotExist(err) {
+			logging.Warn("Skipping %s (does not exist)", d)
+			continue
+		}
+		if err := filepath.Walk(d, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			hdr, err := tar.FileInfoHeader(info, "")
+			if err != nil {
+				return err
+			}
+			hdr.Name = path
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			_, err = io.Copy(tw, file)
+			return err
+		}); err != nil {
+			log.Fatalf("Failed to pack %s: %v", d, err)
+		}
+		logging.Info("Packed %s", d)
+	}
+	logging.Info("Archive created: %s", outFile)
+}
+
+func runUnpack(cmd *cobra.Command, args []string) {
+	tarFile := args[0]
+	f, err := os.Open(tarFile)
+	if err != nil {
+		log.Fatalf("Failed to open archive %s: %v", tarFile, err)
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		log.Fatalf("Failed to read gzip stream: %v", err)
+	}
+	defer gr.Close()
+	tr := tar.NewReader(gr)
+
+	// Delete existing dirs before extracting
+	dirs := []string{dir, istioconfigsPath, xcpconfigsPath}
+	for _, d := range dirs {
+		if err := os.RemoveAll(d); err != nil {
+			logging.Warn("Failed to remove %s: %v", d, err)
+		}
+	}
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatalf("Failed to read archive entry: %v", err)
+		}
+
+		// Safety: prevent path traversal
+		target := filepath.Clean(hdr.Name)
+		if strings.HasPrefix(target, "..") {
+			log.Fatalf("Unsafe path in archive: %s", hdr.Name)
+		}
+
+		if hdr.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0755); err != nil {
+				log.Fatalf("Failed to create directory %s: %v", target, err)
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			log.Fatalf("Failed to create parent dir for %s: %v", target, err)
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			log.Fatalf("Failed to create file %s: %v", target, err)
+		}
+		if _, err := io.Copy(out, tr); err != nil {
+			out.Close()
+			log.Fatalf("Failed to write file %s: %v", target, err)
+		}
+		out.Close()
+	}
+	logging.Info("Unpacked %s", tarFile)
 }
