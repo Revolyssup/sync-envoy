@@ -1,82 +1,29 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
-	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/yaml"
+
+	"sync-envoy/pkg/envoy"
+	"sync-envoy/pkg/file"
+	"sync-envoy/pkg/k8s"
+	"sync-envoy/pkg/logging"
+	"sync-envoy/pkg/provider"
 )
 
-// Log levels
-const (
-	LevelDebug = iota
-	LevelInfo
-	LevelWarn
-	LevelError
-)
-
-var logLevel = LevelInfo
-var logLevelNames = map[string]int{
-	"debug": LevelDebug,
-	"info":  LevelInfo,
-	"warn":  LevelWarn,
-	"error": LevelError,
-}
-
-// Simple leveled logger
-func debug(format string, v ...interface{}) {
-	if logLevel <= LevelDebug {
-		log.Printf("[DEBUG] "+format, v...)
-	}
-}
-func info(format string, v ...interface{}) {
-	if logLevel <= LevelInfo {
-		log.Printf("[INFO] "+format, v...)
-	}
-}
-func warn(format string, v ...interface{}) {
-	if logLevel <= LevelWarn {
-		log.Printf("[WARN] "+format, v...)
-	}
-}
-func errorf(format string, v ...interface{}) {
-	if logLevel <= LevelError {
-		log.Printf("[ERROR] "+format, v...)
-	}
-}
-
-// Global state
 var (
-	interval         time.Duration
 	dir              string
 	namespace        string
 	workloadSelector string
-	syncBack         bool
 	logLevelStr      string
-	dynamicClient    dynamic.Interface
-	discoveryClient  *discovery.DiscoveryClient
+	providerFilter   string
+	csdsAddress      string
 	istioconfigsPath = "istioconfigs"
 )
 
@@ -87,10 +34,7 @@ func main() {
 		Use:   "sync-envoy",
 		Short: "Sync Envoy configs and Istio CRs to/from local files",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			// Set log level
-			if lvl, ok := logLevelNames[logLevelStr]; ok {
-				logLevel = lvl
-			} else {
+			if !logging.SetLevel(logLevelStr) {
 				log.Fatalf("Invalid log level: %s", logLevelStr)
 			}
 			if dir == "" {
@@ -98,17 +42,15 @@ func main() {
 			}
 			os.MkdirAll(dir, 0755)
 			os.MkdirAll(istioconfigsPath, 0755)
-			// Initialize k8s clients
-			initK8sClients()
 		},
 	}
 
-	rootCmd.PersistentFlags().DurationVar(&interval, "interval", 2*time.Second, "Interval for Envoy config sync")
 	rootCmd.PersistentFlags().StringVar(&dir, "dir", "envoyconfigs", "Directory to store Envoy configs")
-	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "Namespace filter for Envoy sync")
-	rootCmd.PersistentFlags().StringVarP(&workloadSelector, "workload-selector", "w", "", "Workload selector (e.g., app=httpbin) for Envoy sync")
-	rootCmd.PersistentFlags().BoolVar(&syncBack, "sync-back", true, "Apply changes from istioconfigs/ back to the cluster")
+	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "Namespace filter")
+	rootCmd.PersistentFlags().StringVarP(&workloadSelector, "workload-selector", "w", "", "Workload selector (e.g., app=httpbin)")
 	rootCmd.PersistentFlags().StringVar(&logLevelStr, "log-level", "info", "Log level: debug, info, warn, error")
+	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,file,envoy")
+	rootCmd.PersistentFlags().StringVar(&csdsAddress, "csds-address", "", "istiod gRPC address for CSDS streaming (e.g., localhost:15010). If empty, falls back to admin/istioctl polling")
 
 	startCmd := &cobra.Command{
 		Use:   "start",
@@ -126,49 +68,41 @@ func main() {
 		Run:   runCleanup,
 	}
 
-	rootCmd.AddCommand(startCmd, stopCmd, cleanupCmd)
+	howCmd := &cobra.Command{
+		Use:   "how",
+		Short: "Explain what sync-envoy does and how it works",
+		Run:   runHow,
+	}
+
+	rootCmd.AddCommand(startCmd, stopCmd, cleanupCmd, howCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
-func initK8sClients() {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			kubeconfig = filepath.Join(os.Getenv("HOME"), ".kube", "config")
-		}
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			log.Fatalf("Failed to build kubeconfig: %v", err)
-		}
-	}
-	dynamicClient, err = dynamic.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Failed to create dynamic client: %v", err)
-	}
-	discoveryClient, err = discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		log.Fatalf("Failed to create discovery client: %v", err)
-	}
-}
-
 func runStart(cmd *cobra.Command, args []string) {
+	// Initialize K8s clients
+	clients, err := k8s.NewClients()
+	if err != nil {
+		log.Fatalf("Failed to initialize Kubernetes clients: %v", err)
+	}
+
+	// Write PID file
 	pid := os.Getpid()
-	if err := ioutil.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
+	if err := os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
 		log.Fatalf("Failed to write PID file: %v", err)
 	}
 	defer os.Remove(pidFile)
 
-	info("Starting sync-envoy with configuration:")
-	info("  interval: %v", interval)
-	info("  envoy dir: %s", dir)
-	info("  namespace filter: %s", namespace)
-	info("  workload selector: %s", workloadSelector)
-	info("  sync-back: %v", syncBack)
-	info("  log level: %s", logLevelStr)
+	logging.Info("Starting sync-envoy with configuration:")
+	logging.Info("  envoy dir: %s", dir)
+	logging.Info("  istioconfigs dir: %s", istioconfigsPath)
+	logging.Info("  namespace: %s", namespace)
+	logging.Info("  workload selector: %s", workloadSelector)
+	logging.Info("  provider filter: %s", providerFilter)
+	logging.Info("  csds address: %s", csdsAddress)
+	logging.Info("  log level: %s", logLevelStr)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,34 +111,51 @@ func runStart(cmd *cobra.Command, args []string) {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		info("Shutting down...")
+		logging.Info("Shutting down...")
 		cancel()
 	}()
 
-	// Start Kubernetes CR watcher
-	go watchIstioCRs(ctx)
+	// Build provider registry
+	registry := provider.NewRegistry()
 
-	// Start file watcher for sync-back (if enabled)
-	if syncBack {
-		go watchFiles(ctx)
+	// Kubernetes provider: watches K8s CRs, writes _current.yaml files
+	registry.Register(provider.New(
+		"kubernetes",
+		k8s.NewCRWatcher(clients),
+		file.NewCurrentFileUpdater(istioconfigsPath).WithSelectorCorrelation(clients, dir),
+	))
+
+	// File provider: watches _desired.yaml files, applies to K8s cluster
+	registry.Register(provider.New(
+		"file",
+		file.NewDesiredFileWatcher(istioconfigsPath),
+		k8s.NewCRUpdater(clients),
+	))
+
+	// Envoy provider: reads envoy configs, writes JSON files
+	registry.Register(provider.New(
+		"envoy",
+		envoy.NewEnvoyWatcher(namespace, workloadSelector, csdsAddress),
+		envoy.NewFileUpdater(dir, "last_updated").WithIstioconfigsPath(istioconfigsPath),
+	))
+
+	// Resolve which providers to run
+	providers, err := registry.Get(providerFilter)
+	if err != nil {
+		log.Fatalf("Failed to resolve providers: %v", err)
 	}
 
-	// Start periodic Envoy config sync
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			syncEnvoyConfigs()
-		}
+	logging.Info("Running %d provider(s)", len(providers))
+	for _, p := range providers {
+		logging.Info("  - %s", p.Name())
 	}
+
+	// Run all providers concurrently, block until ctx is cancelled
+	provider.RunAll(ctx, providers)
 }
 
 func runStop(cmd *cobra.Command, args []string) {
-	data, err := ioutil.ReadFile(pidFile)
+	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		log.Fatalf("No PID file found (is sync-envoy running?): %v", err)
 	}
@@ -213,417 +164,141 @@ func runStop(cmd *cobra.Command, args []string) {
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		log.Fatalf("Failed to stop process: %v", err)
 	}
-	info("Sent SIGTERM to process %d", pid)
+	logging.Info("Sent SIGTERM to process %d", pid)
+}
+
+func runHow(cmd *cobra.Command, args []string) {
+	const (
+		reset  = "\033[0m"
+		bold   = "\033[1m"
+		dim    = "\033[2m"
+		cyan   = "\033[36m"
+		yellow = "\033[33m"
+		green  = "\033[32m"
+		blue   = "\033[34m"
+		magenta = "\033[35m"
+	)
+	p := func(format string, a ...interface{}) { fmt.Printf(format+"\n", a...) }
+	hr := func(label string) {
+		p("\n%s%s── %s %s──────────────────────────────────────────%s", bold, dim, reset+bold, dim, reset)
+		p("%s  %s%s", bold+cyan, label, reset)
+	}
+
+	p("")
+	p("%s╔══════════════════════════════════════════════════════╗%s", bold+cyan, reset)
+	p("%s║               sync-envoy                            ║%s", bold+cyan, reset)
+	p("%s╚══════════════════════════════════════════════════════╝%s", bold+cyan, reset)
+	p("")
+	p("  A bidirectional sync tool for %sIstio CRs%s and %sEnvoy sidecar state%s.", bold, reset, bold, reset)
+	p("  Three concurrent providers, each with a watcher (event producer)")
+	p("  and an updater (event consumer).")
+
+	hr("PROVIDERS")
+
+	p("")
+	p("  %s[kubernetes]%s  K8s CRs → files", bold+green, reset)
+	p("  %sWatcher%s  Dynamic informers for 11 Istio CRD types:", bold, reset)
+	p("           %sVirtualService, DestinationRule, Gateway, ServiceEntry,%s", dim, reset)
+	p("           %sWorkloadEntry, WorkloadGroup, AuthorizationPolicy,%s", dim, reset)
+	p("           %sPeerAuthentication, RequestAuthentication, Telemetry, WasmPlugin%s", dim, reset)
+	p("  %sUpdater%s  Writes  %sistioconfigs/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
+	p("           Skips write when content is unchanged (LCS diff check)")
+
+	p("")
+	p("  %s[file]%s  _desired.yaml → K8s cluster", bold+green, reset)
+	p("  %sWatcher%s  fsnotify watches %sistioconfigs/%s recursively", bold, reset, yellow, reset)
+	p("           Plain .yaml files are %sauto-renamed%s to _desired.yaml", bold, reset)
+	p("           _current.yaml files are ignored")
+	p("  %sUpdater%s  Parses YAML → k8s dynamic client Create/Update", bold, reset)
+	p("           Fetches current cluster state, skips apply when identical")
+
+	p("")
+	p("  %s[envoy]%s  Envoy sidecars → files", bold+green, reset)
+	p("  %sWatcher%s  Three strategies, tried in order:", bold, reset)
+	p("")
+	p("    %s1. CSDS gRPC streaming%s  %s(--csds-address istiod:15010)%s", bold+magenta, reset, dim, reset)
+	p("       Long-running gRPC client to istiod; receives push updates.")
+	p("       Uses go-control-plane protobuf types.")
+	p("")
+	p("    %s2. Admin endpoint polling%s  %s(every 5 s, fallback)%s", bold+magenta, reset, dim, reset)
+	p("       %skubectl exec <pod> -c istio-proxy -- curl localhost:15000/config_dump%s", dim, reset)
+	p("       Extracts: listener, cluster, route, endpoint, bootstrap, secret")
+	p("")
+	p("    %s3. istioctl proxy-config polling%s  %s(every 5 s, final fallback)%s", bold+magenta, reset, dim, reset)
+	p("       %sistioctl proxy-config <type> <pod> -n <ns> -o json%s", dim, reset)
+	p("")
+	p("  %sUpdater%s  Writes  %senvoyconfigs/<ns>/<pod>/<type>.json%s", bold, reset, yellow, reset)
+	p("           JSON includes: last_updated, pod_name, namespace, config_type, config")
+	p("           Ignores %slast_updated%s when diffing (timestamp noise suppressed)", bold, reset)
+	p("           Writes %scorrelation.json%s alongside each pod's configs", bold, reset)
+
+	hr("FILE STRUCTURE")
+	p("")
+	p("  %sistioconfigs/%s", yellow, reset)
+	p("  %s  <namespace>/%s", dim, reset)
+	p("  %s    <kind>/%s", dim, reset)
+	p("      <name>%s_current.yaml%s  ← live cluster state  %s(written by kubernetes provider)%s", green, reset, dim, reset)
+	p("      <name>%s_desired.yaml%s  ← your proposed change %s(edit this)%s", blue, reset, dim, reset)
+	p("      %scorrelation.json%s      ← which Envoy configs reference this resource", bold, reset)
+	p("")
+	p("  %senvoyconfigs/%s", yellow, reset)
+	p("  %s  <namespace>/%s", dim, reset)
+	p("  %s    <pod>/%s", dim, reset)
+	p("      cluster.json, listener.json, route.json, ...")
+	p("      %sdestinationrule-correlation.json%s   ← DRs that shaped clusters", bold, reset)
+	p("      %svirtualservice-correlation.json%s    ← VSs that shaped routes", bold, reset)
+	p("      %sgateway-correlation.json%s            ← Gateways in listener config", bold, reset)
+	p("      %s<kind>-correlation.json%s             ← policy CRs matched by selector", bold, reset)
+
+	hr("CORRELATION")
+	p("")
+	p("  Pilot embeds %sistio.io/config%s metadata in each Envoy cluster,", bold, reset)
+	p("  pointing back to its source Istio CR (e.g. VirtualService, DestinationRule).")
+	p("")
+	p("  Cluster name encodes the full relationship:")
+	p("    %soutbound|9080|v1|reviews.default.svc.cluster.local%s", yellow, reset)
+	p("                  %s^^  ^^^^^^^  ^^^^^^^%s", dim, reset)
+	p("                  %ssubset  service  namespace%s", dim, reset)
+	p("")
+	p("  Parsing names + filter_metadata builds a bidirectional index:")
+	p("    Istio CR   %s──→%s  affected Envoy files  %s(istioconfigs/.../correlation.json)%s", green, reset, dim, reset)
+	p("    Envoy pod  %s──→%s  source Istio CRs      %s(envoyconfigs/.../correlation.json)%s", green, reset, dim, reset)
+
+	hr("DIFF DETECTION")
+	p("")
+	p("  All updaters track last-written state in memory.")
+	p("  Before each write/apply: LCS-based unified diff is computed.")
+	p("    %s• No diff%s  → skip  %s(logged as \"No diff detected\")%s", green, reset, dim, reset)
+	p("    %s• Diff%s    → write/apply  %s(unified diff logged for inspection)%s", yellow, reset, dim, reset)
+
+	hr("TYPICAL WORKFLOW")
+	p("")
+	p("  %s$ sync-envoy start -n default -w app=httpbin%s", bold+cyan, reset)
+	p("")
+	p("  1. %sistioconfigs/default/virtualservice/httpbin_current.yaml%s appears", yellow, reset)
+	p("  2. Copy or edit it as %shttpbin_desired.yaml%s with your changes", bold, reset)
+	p("  3. Tool detects _desired.yaml → applies diff to cluster")
+	p("  4. K8s informer fires → %shttpbin_current.yaml%s is updated", yellow, reset)
+	p("  5. Check %scorrelation.json%s → click file path to see affected Envoy config", bold, reset)
+
+	hr("FLAGS")
+	p("")
+	p("  %s--provider%s           kubernetes,file,envoy  %s(default: all three)%s", bold, reset, dim, reset)
+	p("  %s--namespace%s      -n  target namespace       %s(default: default)%s", bold, reset, dim, reset)
+	p("  %s--workload-selector%s  label selector         %s(e.g. app=httpbin)%s", bold, reset, dim, reset)
+	p("  %s--csds-address%s       istiod gRPC address    %s(e.g. localhost:15010)%s", bold, reset, dim, reset)
+	p("  %s--dir%s                envoy output dir       %s(default: envoyconfigs)%s", bold, reset, dim, reset)
+	p("  %s--log-level%s          debug|info|warn|error  %s(default: info)%s", bold, reset, dim, reset)
+	p("")
 }
 
 func runCleanup(cmd *cobra.Command, args []string) {
 	dirs := []string{"envoyconfigs", istioconfigsPath}
 	for _, d := range dirs {
 		if err := os.RemoveAll(d); err != nil {
-			warn("Failed to remove %s: %v", d, err)
+			logging.Warn("Failed to remove %s: %v", d, err)
 		} else {
-			info("Removed %s", d)
+			logging.Info("Removed %s", d)
 		}
 	}
-}
-
-// watchIstioCRs sets up informers for known Istio CRDs and writes YAML to istioconfigs/.
-func watchIstioCRs(ctx context.Context) {
-	// Common Istio resource types (group, version, resource)
-	resourceTypes := []schema.GroupVersionResource{
-		{Group: "networking.istio.io", Version: "v1", Resource: "virtualservices"},
-		{Group: "networking.istio.io", Version: "v1", Resource: "destinationrules"},
-		{Group: "networking.istio.io", Version: "v1", Resource: "gateways"},
-		{Group: "networking.istio.io", Version: "v1", Resource: "serviceentries"},
-		{Group: "networking.istio.io", Version: "v1", Resource: "workloadentries"},
-		{Group: "networking.istio.io", Version: "v1", Resource: "workloadgroups"},
-		{Group: "security.istio.io", Version: "v1", Resource: "authorizationpolicies"},
-		{Group: "security.istio.io", Version: "v1", Resource: "peerauthentications"},
-		{Group: "security.istio.io", Version: "v1", Resource: "requestauthentications"},
-		{Group: "telemetry.istio.io", Version: "v1", Resource: "telemetries"},
-		{Group: "extensions.istio.io", Version: "v1", Resource: "wasmplugins"},
-	}
-
-	for _, gvr := range resourceTypes {
-		// Check if the resource exists in the cluster
-		exists, err := resourceExists(discoveryClient, gvr)
-		if err != nil {
-			warn("Failed to check resource %s: %v", gvr.Resource, err)
-			continue
-		}
-		if !exists {
-			debug("Resource %s/%s not found, skipping watch.", gvr.GroupVersion(), gvr.Resource)
-			continue
-		}
-		info("Watching resource: %s/%s", gvr.GroupVersion(), gvr.Resource)
-
-		informer := dynamicinformer.NewFilteredDynamicInformer(
-			dynamicClient,
-			gvr,
-			metav1.NamespaceAll,
-			0,
-			cache.Indexers{},
-			nil,
-		)
-		informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				u := obj.(*unstructured.Unstructured)
-				debug("K8s ADD: %s %s/%s", u.GetKind(), u.GetNamespace(), u.GetName())
-				writeIstioCR(u)
-			},
-			UpdateFunc: func(old, new interface{}) {
-				u := new.(*unstructured.Unstructured)
-				debug("K8s UPDATE: %s %s/%s", u.GetKind(), u.GetNamespace(), u.GetName())
-				writeIstioCR(u)
-			},
-			DeleteFunc: func(obj interface{}) {
-				u := obj.(*unstructured.Unstructured)
-				debug("K8s DELETE: %s %s/%s", u.GetKind(), u.GetNamespace(), u.GetName())
-				deleteIstioCR(u)
-			},
-		})
-		go informer.Informer().Run(ctx.Done())
-	}
-	<-ctx.Done()
-}
-
-// resourceExists checks if a given GVR exists in the cluster using discovery.
-func resourceExists(discoveryClient discovery.DiscoveryInterface, gvr schema.GroupVersionResource) (bool, error) {
-	resourceList, err := discoveryClient.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
-	if err != nil {
-		// Group/version doesn't exist
-		return false, nil
-	}
-	for _, resource := range resourceList.APIResources {
-		if resource.Name == gvr.Resource {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// writeIstioCR writes the YAML representation of an Istio CR to disk.
-func writeIstioCR(obj *unstructured.Unstructured) {
-	kind := strings.ToLower(obj.GetKind())
-	name := obj.GetName()
-	namespace := obj.GetNamespace()
-	data, err := yaml.Marshal(obj.Object)
-	if err != nil {
-		errorf("Failed to marshal %s/%s: %v", namespace, name, err)
-		return
-	}
-
-	var path string
-	if namespace == "" {
-		path = filepath.Join(istioconfigsPath, kind, name+".yaml")
-	} else {
-		path = filepath.Join(istioconfigsPath, namespace, kind, name+".yaml")
-	}
-	os.MkdirAll(filepath.Dir(path), 0755)
-	if err := ioutil.WriteFile(path, data, 0644); err != nil {
-		errorf("Failed to write %s: %v", path, err)
-	} else {
-		debug("Written file: %s", path)
-	}
-}
-
-// deleteIstioCR removes the file for a deleted CR.
-func deleteIstioCR(obj *unstructured.Unstructured) {
-	kind := strings.ToLower(obj.GetKind())
-	name := obj.GetName()
-	namespace := obj.GetNamespace()
-	var path string
-	if namespace == "" {
-		path = filepath.Join(istioconfigsPath, kind, name+".yaml")
-	} else {
-		path = filepath.Join(istioconfigsPath, namespace, kind, name+".yaml")
-	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		errorf("Failed to delete %s: %v", path, err)
-	} else {
-		debug("Deleted file: %s", path)
-	}
-}
-
-// watchFiles monitors istioconfigs/ for changes and applies them back to the cluster.
-func watchFiles(ctx context.Context) {
-	var err error
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		errorf("Failed to create file watcher: %v", err)
-		return
-	}
-	defer watcher.Close()
-
-	// Watch the entire istioconfigs tree
-	err = filepath.Walk(istioconfigsPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return watcher.Add(path)
-		}
-		return nil
-	})
-	if err != nil {
-		errorf("Failed to add watches: %v", err)
-		return
-	}
-
-	info("File watcher started on %s", istioconfigsPath)
-
-	// Debounce timer to group rapid events
-	var debounceTimer *time.Timer
-	const debounceDelay = 500 * time.Millisecond
-	var pendingEvent fsnotify.Event
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			// Only care about write and create events on .yaml files
-			if !strings.HasSuffix(event.Name, ".yaml") {
-				continue
-			}
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
-				continue
-			}
-			debug("File event: %s %s", event.Op, event.Name)
-
-			// Debounce: if a timer is already running, stop and restart
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
-			pendingEvent = event
-			debounceTimer = time.AfterFunc(debounceDelay, func() {
-				handleFileEvent(pendingEvent)
-			})
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			errorf("Watcher error: %v", err)
-		}
-	}
-}
-
-// handleFileEvent processes a debounced file event.
-func handleFileEvent(event fsnotify.Event) {
-	debug("Handling file event for %s", event.Name)
-
-	// Read the file
-	data, err := ioutil.ReadFile(event.Name)
-	if err != nil {
-		errorf("Failed to read file %s: %v", event.Name, err)
-		return
-	}
-
-	// Parse YAML into unstructured
-	var obj map[string]interface{}
-	if err := yaml.Unmarshal(data, &obj); err != nil {
-		errorf("Failed to parse YAML from %s: %v", event.Name, err)
-		return
-	}
-	u := &unstructured.Unstructured{Object: obj}
-
-	// Determine namespace and kind from file path for validation
-	relPath, err := filepath.Rel(istioconfigsPath, event.Name)
-	if err != nil {
-		errorf("Failed to get relative path for %s: %v", event.Name, err)
-		return
-	}
-	parts := strings.Split(relPath, string(os.PathSeparator))
-	if len(parts) < 2 {
-		errorf("Unexpected file structure: %s", relPath)
-		return
-	}
-	var fileNamespace, fileKind string
-	if len(parts) == 2 {
-		// cluster-scoped: kind/name.yaml
-		fileKind = parts[0]
-	} else {
-		// namespaced: namespace/kind/name.yaml
-		fileNamespace = parts[0]
-		fileKind = parts[1]
-	}
-
-	// Validate that the kind from file path matches the kind in YAML
-	if strings.ToLower(u.GetKind()) != fileKind {
-		warn("Kind mismatch: file path implies kind %s but YAML has kind %s. Skipping apply.", fileKind, u.GetKind())
-		return
-	}
-	// Validate namespace matches file path (if applicable)
-	if fileNamespace != "" && u.GetNamespace() != fileNamespace {
-		warn("Namespace mismatch: file path implies namespace %s but YAML has namespace %s. Skipping apply.", fileNamespace, u.GetNamespace())
-		return
-	}
-
-	// Remove status and managed fields before applying
-	unstructured.RemoveNestedField(u.Object, "status")
-	unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
-	unstructured.RemoveNestedField(u.Object, "metadata", "resourceVersion")
-	unstructured.RemoveNestedField(u.Object, "metadata", "uid")
-	unstructured.RemoveNestedField(u.Object, "metadata", "creationTimestamp")
-	unstructured.RemoveNestedField(u.Object, "metadata", "generation")
-
-	// Determine GVR from GVK
-	gvk := u.GroupVersionKind()
-	if gvk.Kind == "" {
-		errorf("Missing kind in YAML from %s", event.Name)
-		return
-	}
-
-	// Use discovery to get the correct resource name
-	resourceName, err := getResourceNameFromKind(discoveryClient, gvk)
-	if err != nil {
-		errorf("Failed to discover resource for kind %s: %v", gvk.Kind, err)
-		return
-	}
-	gvr := schema.GroupVersionResource{
-		Group:    gvk.Group,
-		Version:  gvk.Version,
-		Resource: resourceName,
-	}
-
-	// Get current resource from cluster to compare
-	var current *unstructured.Unstructured
-	if fileNamespace == "" {
-		current, err = dynamicClient.Resource(gvr).Get(context.TODO(), u.GetName(), metav1.GetOptions{})
-	} else {
-		current, err = dynamicClient.Resource(gvr).Namespace(fileNamespace).Get(context.TODO(), u.GetName(), metav1.GetOptions{})
-	}
-
-	if err != nil {
-		// Resource does not exist – create it
-		debug("Resource %s/%s not found in cluster, will create", fileNamespace, u.GetName())
-		info("Creating %s %s/%s from file %s", gvk.Kind, fileNamespace, u.GetName(), event.Name)
-		if fileNamespace == "" {
-			_, err = dynamicClient.Resource(gvr).Create(context.TODO(), u, metav1.CreateOptions{})
-		} else {
-			_, err = dynamicClient.Resource(gvr).Namespace(fileNamespace).Create(context.TODO(), u, metav1.CreateOptions{})
-		}
-		if err != nil {
-			errorf("Failed to create %s: %v", event.Name, err)
-		} else {
-			debug("Successfully created %s", event.Name)
-		}
-		return
-	}
-
-	// Resource exists – compare and possibly update
-	// Capture resourceVersion BEFORE stripping it from current
-	currentRV := current.GetResourceVersion()
-
-	// Remove status and managed fields from current for comparison
-	unstructured.RemoveNestedField(current.Object, "status")
-	unstructured.RemoveNestedField(current.Object, "metadata", "managedFields")
-	unstructured.RemoveNestedField(current.Object, "metadata", "resourceVersion")
-	unstructured.RemoveNestedField(current.Object, "metadata", "uid")
-	unstructured.RemoveNestedField(current.Object, "metadata", "creationTimestamp")
-	unstructured.RemoveNestedField(current.Object, "metadata", "generation")
-
-	// Compare objects (ignoring status)
-	currentJSON, _ := json.Marshal(current.Object)
-	newJSON, _ := json.Marshal(u.Object)
-	if bytes.Equal(currentJSON, newJSON) {
-		debug("No changes detected for %s, skipping apply", event.Name)
-		return
-	}
-
-	// Update: set resourceVersion from the captured value
-	u.SetResourceVersion(currentRV)
-	info("Updating %s %s/%s from file %s", gvk.Kind, fileNamespace, u.GetName(), event.Name)
-	if fileNamespace == "" {
-		_, err = dynamicClient.Resource(gvr).Update(context.TODO(), u, metav1.UpdateOptions{})
-	} else {
-		_, err = dynamicClient.Resource(gvr).Namespace(fileNamespace).Update(context.TODO(), u, metav1.UpdateOptions{})
-	}
-	if err != nil {
-		errorf("Failed to update %s: %v", event.Name, err)
-	} else {
-		debug("Successfully updated %s", event.Name)
-	}
-}
-
-// getResourceNameFromKind uses discovery to find the resource name for a given GVK.
-func getResourceNameFromKind(discoveryClient discovery.DiscoveryInterface, gvk schema.GroupVersionKind) (string, error) {
-	resourceList, err := discoveryClient.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
-	if err != nil {
-		return "", err
-	}
-	for _, resource := range resourceList.APIResources {
-		if resource.Kind == gvk.Kind {
-			return resource.Name, nil
-		}
-	}
-	return "", fmt.Errorf("no resource found for kind %s in group %s", gvk.Kind, gvk.GroupVersion())
-}
-
-// syncEnvoyConfigs runs `istioctl proxy-config` on selected workloads and saves outputs.
-func syncEnvoyConfigs() {
-	pods, err := getPods(namespace, workloadSelector)
-	if err != nil {
-		errorf("Failed to list pods: %v", err)
-		return
-	}
-	types := []string{"listener", "cluster", "endpoint", "route", "bootstrap", "secret"}
-
-	for _, pod := range pods {
-		podName := pod.name
-		podNS := pod.namespace
-		podDir := filepath.Join(dir, podNS, podName)
-		os.MkdirAll(podDir, 0755)
-
-		for _, typ := range types {
-			out, err := runIstioctlProxyConfig(podName, podNS, typ)
-			if err != nil {
-				// Many pods won't have sidecars; skip silently
-				continue
-			}
-			filePath := filepath.Join(podDir, typ+".json")
-			if err := ioutil.WriteFile(filePath, out, 0644); err != nil {
-				errorf("Failed to write %s: %v", filePath, err)
-			} else {
-				debug("Written Envoy config %s for %s/%s", typ, podNS, podName)
-			}
-		}
-	}
-}
-
-type podInfo struct {
-	name      string
-	namespace string
-}
-
-func getPods(namespace, selector string) ([]podInfo, error) {
-	args := []string{"get", "pods", "-n", namespace, "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.metadata.namespace}{\"\\n\"}{end}"}
-	if selector != "" {
-		args = append(args, "-l", selector)
-	}
-	cmd := exec.Command("kubectl", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("kubectl failed: %v\n%s", err, out)
-	}
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	var pods []podInfo
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) >= 2 {
-			pods = append(pods, podInfo{name: parts[0], namespace: parts[1]})
-		}
-	}
-	return pods, nil
-}
-
-func runIstioctlProxyConfig(pod, namespace, typ string) ([]byte, error) {
-	cmd := exec.Command("istioctl", "proxy-config", typ, pod, "-n", namespace, "-o", "json")
-	return cmd.CombinedOutput()
 }
