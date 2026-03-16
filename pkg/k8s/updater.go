@@ -21,6 +21,7 @@ import (
 type CRUpdater struct {
 	clients     *Clients
 	lastApplied map[string][]byte
+	showDiff    bool
 }
 
 func NewCRUpdater(clients *Clients) *CRUpdater {
@@ -28,6 +29,12 @@ func NewCRUpdater(clients *Clients) *CRUpdater {
 		clients:     clients,
 		lastApplied: make(map[string][]byte),
 	}
+}
+
+// WithShowDiff enables printing unified diffs when changes are detected.
+func (u *CRUpdater) WithShowDiff(show bool) *CRUpdater {
+	u.showDiff = show
+	return u
 }
 
 func (u *CRUpdater) Name() string { return "kubernetes-updater" }
@@ -44,7 +51,11 @@ func (u *CRUpdater) Update(ctx context.Context, event types.Event) error {
 			logging.Debug("No diff for %s, skipping cluster apply", event.Key)
 			return nil
 		}
-		logging.Info("Diff detected for %s:\n%s", event.Key, d)
+		if u.showDiff {
+			logging.Info("Diff detected for %s:\n%s", event.Key, d)
+		} else {
+			logging.Debug("Diff detected for %s:\n%s", event.Key, d)
+		}
 	}
 
 	return u.applyResource(ctx, event)
@@ -124,18 +135,45 @@ func (u *CRUpdater) applyResource(ctx context.Context, event types.Event) error 
 }
 
 func (u *CRUpdater) deleteResource(ctx context.Context, event types.Event) error {
-	kind := event.Metadata["kind"]
-	name := event.Metadata["name"]
-	ns := event.Metadata["namespace"]
-
-	if kind == "" || name == "" {
-		return fmt.Errorf("delete event missing kind or name metadata")
+	if len(event.OldData) == 0 {
+		logging.Warn("Delete event for %s has no content, cannot determine resource to delete from cluster", event.Key)
+		delete(u.lastApplied, event.Key)
+		return nil
 	}
 
-	gvk := schema.GroupVersionKind{Kind: kind}
-	// Try to find the GVR - we need group/version info
-	// For delete from file, we won't have full GVK info, so skip
-	logging.Debug("Delete event for %s %s/%s - cluster deletion not implemented from file watcher", gvk.Kind, ns, name)
+	var obj map[string]interface{}
+	if err := yaml.Unmarshal(event.OldData, &obj); err != nil {
+		return fmt.Errorf("failed to parse YAML for delete: %w", err)
+	}
+	un := &unstructured.Unstructured{Object: obj}
+
+	gvk := un.GroupVersionKind()
+	if gvk.Kind == "" {
+		return fmt.Errorf("missing kind in YAML for delete of %s", event.Key)
+	}
+
+	resourceName, err := GetResourceNameFromKind(u.clients.Discovery, gvk)
+	if err != nil {
+		return fmt.Errorf("failed to discover resource for kind %s: %w", gvk.Kind, err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group: gvk.Group, Version: gvk.Version, Resource: resourceName,
+	}
+
+	ns := un.GetNamespace()
+	name := un.GetName()
+
+	logging.Info("Deleting %s %s/%s from cluster", gvk.Kind, ns, name)
+	if ns == "" {
+		err = u.clients.Dynamic.Resource(gvr).Delete(ctx, name, metav1.DeleteOptions{})
+	} else {
+		err = u.clients.Dynamic.Resource(gvr).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete %s %s/%s: %w", gvk.Kind, ns, name, err)
+	}
+
 	delete(u.lastApplied, event.Key)
+	logging.Debug("Successfully deleted %s %s/%s", gvk.Kind, ns, name)
 	return nil
 }

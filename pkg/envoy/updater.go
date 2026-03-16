@@ -17,6 +17,7 @@ type FileUpdater struct {
 	lastWritten map[string][]byte
 	ignorePaths []string
 	mu          sync.Mutex
+	showDiff    bool
 }
 
 func NewFileUpdater(baseDir string, ignorePaths ...string) *FileUpdater {
@@ -25,6 +26,12 @@ func NewFileUpdater(baseDir string, ignorePaths ...string) *FileUpdater {
 		lastWritten: make(map[string][]byte),
 		ignorePaths: ignorePaths,
 	}
+}
+
+// WithShowDiff enables printing unified diffs when changes are detected.
+func (u *FileUpdater) WithShowDiff(show bool) *FileUpdater {
+	u.showDiff = show
+	return u
 }
 
 func (u *FileUpdater) Name() string { return "envoy-file-updater" }
@@ -50,7 +57,11 @@ func (u *FileUpdater) Update(ctx context.Context, event types.Event) error {
 			logging.Debug("No diff for envoy config %s, skipping write", filePath)
 			return nil
 		}
-		logging.Info("Diff detected for envoy config %s:\n%s", filePath, d)
+		if u.showDiff {
+			logging.Info("Diff detected for envoy config %s:\n%s", filePath, d)
+		} else {
+			logging.Debug("Diff detected for envoy config %s:\n%s", filePath, d)
+		}
 	}
 
 	if err := os.WriteFile(filePath, event.NewData, 0644); err != nil {

@@ -32,6 +32,7 @@ type XCPFileUpdater struct {
 	topology    *topology.File
 	lastWritten map[string][]byte
 	mu          sync.Mutex
+	showDiff    bool
 }
 
 func NewXCPFileUpdater(xcpBasePath string, clients *k8s.Clients, topo *topology.File) *XCPFileUpdater {
@@ -41,6 +42,12 @@ func NewXCPFileUpdater(xcpBasePath string, clients *k8s.Clients, topo *topology.
 		topology:    topo,
 		lastWritten: make(map[string][]byte),
 	}
+}
+
+// WithShowDiff enables printing unified diffs when changes are detected.
+func (u *XCPFileUpdater) WithShowDiff(show bool) *XCPFileUpdater {
+	u.showDiff = show
+	return u
 }
 
 func (u *XCPFileUpdater) Name() string { return "xcp-file-updater" }
@@ -84,12 +91,23 @@ func (u *XCPFileUpdater) Update(ctx context.Context, event types.Event) error {
 			logging.Debug("No diff for XCP %s, skipping write", path)
 			return nil
 		}
-		logging.Info("Diff detected for XCP %s:\n%s", path, d)
+		if u.showDiff {
+			logging.Info("Diff detected for XCP %s:\n%s", path, d)
+		} else {
+			logging.Debug("Diff detected for XCP %s:\n%s", path, d)
+		}
 	}
 
 	os.MkdirAll(filepath.Dir(path), 0755)
 	if err := os.WriteFile(path, event.NewData, 0644); err != nil {
 		return err
+	}
+
+	// Seed _desired.yaml if it doesn't exist yet, so users can edit it directly.
+	desiredPath := strings.TrimSuffix(path, "_current.yaml") + "_desired.yaml"
+	if _, err := os.Stat(desiredPath); os.IsNotExist(err) {
+		os.WriteFile(desiredPath, event.NewData, 0644)
+		logging.Debug("Seeded desired file: %s", desiredPath)
 	}
 
 	u.mu.Lock()
@@ -125,7 +143,7 @@ func (u *XCPFileUpdater) updateTopology(ctx context.Context, kind, name, ns stri
 	var edges []topology.Edge
 
 	for _, istioKind := range istioKinds {
-		refs := u.findIstioResources(ctx, istioKind, name, ns, xcpLabels)
+		refs := u.findIstioResources(ctx, istioKind, name, ns, xcpLabels, metadata)
 		for _, ref := range refs {
 			target := ref.Kind + "/" + ref.Name
 			if ref.Namespace != "" && ref.Namespace != ns {
@@ -142,9 +160,13 @@ func (u *XCPFileUpdater) updateTopology(ctx context.Context, kind, name, ns stri
 	}
 }
 
-// findIstioResources looks for Istio resources of istioKind in the same namespace
-// that were produced by the XCP resource.
-func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpName, ns string, xcpLabels map[string]string) []istioRef {
+// xcpMulticlusterNamespace is the namespace where XCP creates multi-cluster
+// ServiceEntry and DestinationRule resources.
+const xcpMulticlusterNamespace = "xcp-multicluster"
+
+// findIstioResources looks for Istio resources of istioKind that were produced
+// by the XCP resource, using three strategies.
+func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpName, ns string, xcpLabels map[string]string, metadata map[string]string) []istioRef {
 	gvr, ok := IstioGVRForKind(istioKind)
 	if !ok {
 		return nil
@@ -179,6 +201,32 @@ func (u *XCPFileUpdater) findIstioResources(ctx context.Context, istioKind, xcpN
 			Name:      xcpName,
 			Namespace: ns,
 		}}
+	}
+
+	// Strategy 3: Multi-cluster naming convention for gateway-type XCP resources.
+	// XCP creates ServiceEntry/DestinationRule in xcp-multicluster namespace
+	// with names following the pattern: global-gateway-<hostname-dots-to-dashes>
+	if istioKind == "ServiceEntry" || istioKind == "DestinationRule" {
+		if hostnamesJSON := metadata["hostnames"]; hostnamesJSON != "" {
+			var hostnames []string
+			if err := json.Unmarshal([]byte(hostnamesJSON), &hostnames); err == nil {
+				var refs []istioRef
+				for _, hostname := range hostnames {
+					mcName := "global-gateway-" + strings.ReplaceAll(hostname, ".", "-")
+					_, err := u.clients.Dynamic.Resource(gvr).Namespace(xcpMulticlusterNamespace).Get(ctx, mcName, metav1.GetOptions{})
+					if err == nil {
+						refs = append(refs, istioRef{
+							Kind:      istioKind,
+							Name:      mcName,
+							Namespace: xcpMulticlusterNamespace,
+						})
+					}
+				}
+				if len(refs) > 0 {
+					return refs
+				}
+			}
+		}
 	}
 
 	return nil

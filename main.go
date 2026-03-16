@@ -18,6 +18,7 @@ import (
 	"github.com/revolyssup/sync-envoy/pkg/envoy"
 	"github.com/revolyssup/sync-envoy/pkg/file"
 	"github.com/revolyssup/sync-envoy/pkg/k8s"
+	"github.com/revolyssup/sync-envoy/pkg/lock"
 	"github.com/revolyssup/sync-envoy/pkg/logging"
 	"github.com/revolyssup/sync-envoy/pkg/provider"
 	"github.com/revolyssup/sync-envoy/pkg/topology"
@@ -30,8 +31,10 @@ var (
 	logLevelStr      string
 	providerFilter   string
 	csdsAddress      string
-	istioconfigsPath = "istioconfigs"
-	xcpconfigsPath   = "xcpconfigs"
+	showDiffFilter   string
+	istioconfigsPath string
+	xcpconfigsPath   string
+	envoyConfigsPath string
 	packName         string
 )
 
@@ -46,19 +49,25 @@ func main() {
 				log.Fatalf("Invalid log level: %s", logLevelStr)
 			}
 			if dir == "" {
-				dir = "envoyconfigs"
+				dir = "."
 			}
-			os.MkdirAll(dir, 0755)
-			os.MkdirAll(istioconfigsPath, 0755)
-			os.MkdirAll(xcpconfigsPath, 0755)
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				log.Fatalf("Failed to resolve absolute path for %s: %v", dir, err)
+			}
+			dir = absDir
+			envoyConfigsPath = filepath.Join(dir, "syncconfigs", "envoy")
+			istioconfigsPath = filepath.Join(dir, "syncconfigs", "istio")
+			xcpconfigsPath = filepath.Join(dir, "syncconfigs", "xcp")
 		},
 	}
 
-	rootCmd.PersistentFlags().StringVar(&dir, "dir", "envoyconfigs", "Directory to store Envoy configs")
+	rootCmd.PersistentFlags().StringVar(&dir, "dir", ".", "Base directory to store syncconfigs/ (created if it does not exist)")
 	rootCmd.PersistentFlags().StringVarP(&workloadSelector, "workload-selector", "w", "", "Workload selector (e.g., app=httpbin)")
 	rootCmd.PersistentFlags().StringVar(&logLevelStr, "log-level", "info", "Log level: debug, info, warn, error")
 	rootCmd.PersistentFlags().StringVar(&providerFilter, "provider", "", "Comma-separated list of providers to enable (default: all). Options: kubernetes,istio-file,envoy,xcp,xcp-file")
 	rootCmd.PersistentFlags().StringVar(&csdsAddress, "csds-address", "", "istiod gRPC address for CSDS streaming (e.g., localhost:15010). If empty, falls back to admin/istioctl polling")
+	rootCmd.PersistentFlags().StringVar(&showDiffFilter, "show-diff", "kubernetes,xcp", "Comma-separated list of providers to show diffs for (default: kubernetes,xcp)")
 
 	startCmd := &cobra.Command{
 		Use:   "start",
@@ -72,7 +81,7 @@ func main() {
 	}
 	cleanupCmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Delete all generated files in envoyconfigs and istioconfigs",
+		Short: "Delete all generated files in syncconfigs/",
 		Run:   runCleanup,
 	}
 
@@ -84,14 +93,14 @@ func main() {
 
 	packCmd := &cobra.Command{
 		Use:   "pack",
-		Short: "Pack envoyconfigs, istioconfigs and xcpconfigs into a tar.gz archive",
+		Short: "Pack syncconfigs/ into a tar.gz archive",
 		Run:   runPack,
 	}
 	packCmd.Flags().StringVar(&packName, "name", "packed-envoy-configs", "Name of the output tar.gz file (without extension)")
 
 	unpackCmd := &cobra.Command{
 		Use:   "unpack <tarfile>",
-		Short: "Unpack a tar.gz archive into envoyconfigs, istioconfigs and xcpconfigs",
+		Short: "Unpack a tar.gz archive into syncconfigs/",
 		Args:  cobra.ExactArgs(1),
 		Run:   runUnpack,
 	}
@@ -103,7 +112,24 @@ func main() {
 	}
 }
 
+func ensureSyncDirs() {
+	os.MkdirAll(dir, 0755)
+	os.MkdirAll(envoyConfigsPath, 0755)
+	os.MkdirAll(istioconfigsPath, 0755)
+	os.MkdirAll(xcpconfigsPath, 0755)
+}
+
 func runStart(cmd *cobra.Command, args []string) {
+	ensureSyncDirs()
+
+	// Acquire directory lock to prevent concurrent instances on the same directory.
+	syncDir := filepath.Join(dir, "syncconfigs")
+	instanceID, err := lock.Acquire(syncDir)
+	if err != nil {
+		log.Fatalf("Failed to acquire lock: %v", err)
+	}
+	defer lock.Release(instanceID)
+
 	// Initialize K8s clients
 	clients, err := k8s.NewClients()
 	if err != nil {
@@ -118,9 +144,10 @@ func runStart(cmd *cobra.Command, args []string) {
 	defer os.Remove(pidFile)
 
 	logging.Info("Starting sync-envoy with configuration:")
-	logging.Info("  envoy dir: %s", dir)
-	logging.Info("  istioconfigs dir: %s", istioconfigsPath)
-	logging.Info("  xcpconfigs dir: %s", xcpconfigsPath)
+	logging.Info("  base dir: %s", dir)
+	logging.Info("  envoy dir: %s", envoyConfigsPath)
+	logging.Info("  istio dir: %s", istioconfigsPath)
+	logging.Info("  xcp dir: %s", xcpconfigsPath)
 	logging.Info("  workload selector: %s", workloadSelector)
 	logging.Info("  provider filter: %s", providerFilter)
 	logging.Info("  csds address: %s", csdsAddress)
@@ -134,8 +161,32 @@ func runStart(cmd *cobra.Command, args []string) {
 	go func() {
 		<-sigCh
 		logging.Info("Shutting down...")
+		lock.Release(instanceID) // explicit release; defers don't run on os.Exit
 		cancel()
 	}()
+
+	// Clean stale _current.yaml files so they are recreated fresh from cluster state.
+	cleanCurrentFiles(istioconfigsPath, xcpconfigsPath)
+
+	// Parse --show-diff filter into a set for quick lookup.
+	showDiffSet := make(map[string]bool)
+	for _, name := range strings.Split(showDiffFilter, ",") {
+		showDiffSet[strings.TrimSpace(name)] = true
+	}
+
+	// Determine which CR providers are active so file providers know whether
+	// to apply _desired.yaml at startup. When no filter is set, all run.
+	providerActive := func(name string) bool {
+		if providerFilter == "" {
+			return true
+		}
+		for _, n := range strings.Split(providerFilter, ",") {
+			if strings.TrimSpace(n) == name {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Build provider registry
 	registry := provider.NewRegistry()
@@ -148,35 +199,37 @@ func runStart(cmd *cobra.Command, args []string) {
 	registry.Register(provider.New(
 		"kubernetes",
 		k8s.NewCRWatcher(clients),
-		file.NewCurrentFileUpdater(istioconfigsPath).WithTopology(istioTopology),
+		file.NewCurrentFileUpdater(istioconfigsPath).WithTopology(istioTopology).WithShowDiff(showDiffSet["kubernetes"]),
 	))
 
-	// Istio-file provider: watches _desired.yaml files in istioconfigs/, applies to K8s cluster
+	// Istio-file provider: watches _desired.yaml files in syncconfigs/istio/, applies to K8s cluster
+	// Only applies pre-existing _desired at startup when kubernetes provider is also active.
 	registry.Register(provider.New(
 		"istio-file",
-		file.NewDesiredFileWatcher(istioconfigsPath),
-		k8s.NewCRUpdater(clients),
+		file.NewDesiredFileWatcher(istioconfigsPath).WithApplyOnStartup(providerActive("kubernetes")),
+		k8s.NewCRUpdater(clients).WithShowDiff(showDiffSet["istio-file"]),
 	))
 
 	// Envoy provider: reads envoy configs, writes JSON files
 	registry.Register(provider.New(
 		"envoy",
 		envoy.NewEnvoyWatcher(workloadSelector, csdsAddress),
-		envoy.NewFileUpdater(dir, "last_updated"),
+		envoy.NewFileUpdater(envoyConfigsPath, "last_updated").WithShowDiff(showDiffSet["envoy"]),
 	))
 
 	// XCP provider: watches XCP CRDs, writes _current.yaml + XCP→Istio topology
 	registry.Register(provider.New(
 		"xcp",
 		xcp.NewXCPWatcher(clients),
-		xcp.NewXCPFileUpdater(xcpconfigsPath, clients, xcpTopology),
+		xcp.NewXCPFileUpdater(xcpconfigsPath, clients, xcpTopology).WithShowDiff(showDiffSet["xcp"]),
 	))
 
-	// XCP file provider: watches _desired.yaml in xcpconfigs/, applies to K8s cluster
+	// XCP file provider: watches _desired.yaml in syncconfigs/xcp/, applies to K8s cluster
+	// Only applies pre-existing _desired at startup when xcp provider is also active.
 	registry.Register(provider.New(
 		"xcp-file",
-		file.NewDesiredFileWatcher(xcpconfigsPath),
-		k8s.NewCRUpdater(clients),
+		file.NewDesiredFileWatcher(xcpconfigsPath).WithApplyOnStartup(providerActive("xcp")),
+		k8s.NewCRUpdater(clients).WithShowDiff(showDiffSet["xcp-file"]),
 	))
 
 	// Resolve which providers to run
@@ -185,29 +238,23 @@ func runStart(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to resolve providers: %v", err)
 	}
 
-	// xcp-file and istio-file are mutually exclusive: when xcp-file is active,
-	// xcpconfigs/ is the source of truth for desired state, so istio-file is disabled.
-	xcpFileActive := false
-	for _, p := range providers {
-		if p.Name() == "xcp-file" {
-			xcpFileActive = true
-			break
-		}
-	}
-	if xcpFileActive {
-		logging.Warn("xcp-file provider is active: istio-file provider disabled (source of truth is xcpconfigs/)")
-		filtered := providers[:0]
-		for _, p := range providers {
-			if p.Name() != "istio-file" {
-				filtered = append(filtered, p)
-			}
-		}
-		providers = filtered
-	}
-
 	logging.Info("Running %d provider(s)", len(providers))
 	for _, p := range providers {
 		logging.Info("  - %s", p.Name())
+	}
+
+	// Warn if file-applying providers are active and _desired.yaml files exist.
+	if needsStartupWarning(providers) {
+		fmt.Println("\033[33mWARNING:\033[0m An existing cluster state is detected on file system.")
+		fmt.Println("These files will be applied on the running cluster.")
+		fmt.Print("Please confirm that is okay and press y: ")
+		var response string
+		fmt.Scanln(&response)
+		if strings.ToLower(strings.TrimSpace(response)) != "y" {
+			logging.Info("User declined, exiting.")
+			lock.Release(instanceID)
+			os.Exit(0)
+		}
 	}
 
 	// Run all providers concurrently, block until ctx is cancelled
@@ -261,12 +308,12 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("           %sVirtualService, DestinationRule, Gateway, ServiceEntry,%s", dim, reset)
 	p("           %sWorkloadEntry, WorkloadGroup, AuthorizationPolicy,%s", dim, reset)
 	p("           %sPeerAuthentication, RequestAuthentication, Telemetry, WasmPlugin%s", dim, reset)
-	p("  %sUpdater%s  Writes  %sistioconfigs/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
+	p("  %sUpdater%s  Writes  %ssyncconfigs/istio/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
 	p("           Skips write when content is unchanged (LCS diff check)")
 
 	p("")
 	p("  %s[istio-file]%s  _desired.yaml → K8s cluster", bold+green, reset)
-	p("  %sWatcher%s  fsnotify watches %sistioconfigs/%s recursively", bold, reset, yellow, reset)
+	p("  %sWatcher%s  fsnotify watches %ssyncconfigs/istio/%s recursively", bold, reset, yellow, reset)
 	p("           Plain .yaml files are %sauto-renamed%s to _desired.yaml", bold, reset)
 	p("           _current.yaml files are ignored")
 	p("  %sUpdater%s  Parses YAML → k8s dynamic client Create/Update", bold, reset)
@@ -287,7 +334,7 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("    %s3. istioctl proxy-config polling%s  %s(every 5 s, final fallback)%s", bold+magenta, reset, dim, reset)
 	p("       %sistioctl proxy-config <type> <pod> -n <ns> -o json%s", dim, reset)
 	p("")
-	p("  %sUpdater%s  Writes  %senvoyconfigs/<ns>/<pod>/<type>.json%s", bold, reset, yellow, reset)
+	p("  %sUpdater%s  Writes  %ssyncconfigs/envoy/<ns>/<pod>/<type>.json%s", bold, reset, yellow, reset)
 	p("           JSON includes: last_updated, pod_name, namespace, config_type, config")
 	p("           Ignores %slast_updated%s when diffing (timestamp noise suppressed)", bold, reset)
 
@@ -296,30 +343,30 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("  %sWatcher%s  Dynamic informers for XCP CRD types across 6 API groups:", bold, reset)
 	p("           %sxcp.tetrate.io, traffic.xcp.tetrate.io, gateway.xcp.tetrate.io,%s", dim, reset)
 	p("           %ssecurity.xcp.tetrate.io, extension.xcp.tetrate.io, istiointernal.xcp.tetrate.io%s", dim, reset)
-	p("  %sUpdater%s  Writes  %sxcpconfigs/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
+	p("  %sUpdater%s  Writes  %ssyncconfigs/xcp/<ns>/<kind>/<name>_current.yaml%s", bold, reset, yellow, reset)
 	p("           Maps XCP → Istio via hierarchy labels + name matching")
-	p("           Writes %sxcpconfigs/topology.md%s (XCP→Istio resource map)", bold, reset)
+	p("           Writes %ssyncconfigs/xcp/topology.md%s (XCP→Istio resource map)", bold, reset)
 
 	p("")
 	p("  %s[xcp-file]%s  _desired.yaml → K8s cluster (for XCP resources)", bold+green, reset)
-	p("  %sWatcher%s  fsnotify watches %sxcpconfigs/%s recursively", bold, reset, yellow, reset)
+	p("  %sWatcher%s  fsnotify watches %ssyncconfigs/xcp/%s recursively", bold, reset, yellow, reset)
 	p("  %sUpdater%s  Reuses the same k8s CRUpdater as [file] provider", bold, reset)
 
 	hr("FILE STRUCTURE")
 	p("")
-	p("  %sistioconfigs/%s", yellow, reset)
+	p("  %ssyncconfigs/istio/%s", yellow, reset)
 	p("  %s  <namespace>/%s", dim, reset)
 	p("  %s    <kind>/%s", dim, reset)
 	p("      <name>%s_current.yaml%s  ← live cluster state  %s(written by kubernetes provider)%s", green, reset, dim, reset)
 	p("      <name>%s_desired.yaml%s  ← your proposed change %s(edit this)%s", blue, reset, dim, reset)
 	p("    %stopology.md%s              ← Istio resource relationship map", bold, reset)
 	p("")
-	p("  %senvoyconfigs/%s", yellow, reset)
+	p("  %ssyncconfigs/envoy/%s", yellow, reset)
 	p("  %s  <namespace>/%s", dim, reset)
 	p("  %s    <pod>/%s", dim, reset)
 	p("      cluster.json, listener.json, route.json, ...")
 	p("")
-	p("  %sxcpconfigs/%s", yellow, reset)
+	p("  %ssyncconfigs/xcp/%s", yellow, reset)
 	p("  %s  <namespace>/%s", dim, reset)
 	p("  %s    <kind>/%s", dim, reset)
 	p("      <name>%s_current.yaml%s  ← live XCP CR state     %s(written by xcp provider)%s", green, reset, dim, reset)
@@ -328,7 +375,7 @@ func runHow(cmd *cobra.Command, args []string) {
 
 	hr("TOPOLOGY")
 	p("")
-	p("  %sistioconfigs/topology.md%s  maps Istio resource relationships:", bold, reset)
+	p("  %ssyncconfigs/istio/topology.md%s  maps Istio resource relationships:", bold, reset)
 	p("    VirtualService → Gateway (spec.gateways)")
 	p("    VirtualService → destination hosts (spec.http[].route)")
 	p("    Gateway → workload selector (spec.selector)")
@@ -337,7 +384,7 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("    ServiceEntry → hosts")
 	p("    + XCP provenance labels when present")
 	p("")
-	p("  %sxcpconfigs/topology.md%s  maps XCP → Istio resources:", bold, reset)
+	p("  %ssyncconfigs/xcp/topology.md%s  maps XCP → Istio resources:", bold, reset)
 	p("    e.g. IngressGateway/foo %s──→%s Gateway/foo, VirtualService/vs-foo", green, reset)
 
 	hr("DIFF DETECTION")
@@ -351,7 +398,7 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("")
 	p("  %s$ sync-envoy start -n default -w app=httpbin%s", bold+cyan, reset)
 	p("")
-	p("  1. %sistioconfigs/default/virtualservice/httpbin_current.yaml%s appears", yellow, reset)
+	p("  1. %ssyncconfigs/istio/default/virtualservice/httpbin_current.yaml%s appears", yellow, reset)
 	p("  2. Copy or edit it as %shttpbin_desired.yaml%s with your changes", bold, reset)
 	p("  3. Tool detects _desired.yaml → applies diff to cluster")
 	p("  4. K8s informer fires → %shttpbin_current.yaml%s is updated", yellow, reset)
@@ -362,23 +409,84 @@ func runHow(cmd *cobra.Command, args []string) {
 	p("  %s--provider%s           kubernetes,istio-file,envoy,xcp,xcp-file  %s(default: all)%s", bold, reset, dim, reset)
 	p("  %s--workload-selector%s  label selector         %s(e.g. app=httpbin)%s", bold, reset, dim, reset)
 	p("  %s--csds-address%s       istiod gRPC address    %s(e.g. localhost:15010)%s", bold, reset, dim, reset)
-	p("  %s--dir%s                envoy output dir       %s(default: envoyconfigs)%s", bold, reset, dim, reset)
+	p("  %s--dir%s                base output dir        %s(default: current directory)%s", bold, reset, dim, reset)
 	p("  %s--log-level%s          debug|info|warn|error  %s(default: info)%s", bold, reset, dim, reset)
 	p("")
 }
 
-func runCleanup(cmd *cobra.Command, args []string) {
-	dirs := []string{"envoyconfigs", istioconfigsPath, xcpconfigsPath}
-	for _, d := range dirs {
-		if err := os.RemoveAll(d); err != nil {
-			logging.Warn("Failed to remove %s: %v", d, err)
-		} else {
-			logging.Info("Removed %s", d)
+// cleanCurrentFiles removes all _current.yaml files from the given directories
+// so they are recreated fresh from cluster state on startup.
+func cleanCurrentFiles(dirs ...string) {
+	for _, dir := range dirs {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(path, "_current.yaml") {
+				os.Remove(path)
+				logging.Debug("Removed stale current file: %s", path)
+			}
+			return nil
+		})
+	}
+}
+
+// needsStartupWarning returns true if file-applying providers are active
+// and their directories contain _desired.yaml files that would be applied.
+func needsStartupWarning(providers []*provider.Provider) bool {
+	activeNames := make(map[string]bool)
+	for _, p := range providers {
+		activeNames[p.Name()] = true
+	}
+	if activeNames["istio-file"] && hasDesiredFiles(istioconfigsPath) {
+		return true
+	}
+	if activeNames["xcp-file"] && hasDesiredFiles(xcpconfigsPath) {
+		return true
+	}
+	return false
+}
+
+// hasDesiredFiles checks if a directory tree contains any _desired.yaml files.
+func hasDesiredFiles(basePath string) bool {
+	found := false
+	filepath.Walk(basePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
 		}
+		if strings.HasSuffix(path, "_desired.yaml") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+func runCleanup(cmd *cobra.Command, args []string) {
+	syncDir := filepath.Join(dir, "syncconfigs")
+
+	// Refuse to clean up if another instance owns this directory.
+	ownerPID, locked, err := lock.CheckDirectory(syncDir)
+	if err != nil {
+		logging.Warn("Failed to check lock: %v", err)
+	} else if locked {
+		log.Fatalf("Cannot clean up %s: directory is locked by process %d. Stop that instance first.", syncDir, ownerPID)
+	}
+
+	if err := os.RemoveAll(syncDir); err != nil {
+		logging.Warn("Failed to remove %s: %v", syncDir, err)
+	} else {
+		logging.Info("Removed %s", syncDir)
 	}
 }
 
 func runPack(cmd *cobra.Command, args []string) {
+	syncDir := filepath.Join(dir, "syncconfigs")
+	if _, err := os.Stat(syncDir); os.IsNotExist(err) {
+		log.Fatalf("Directory %s does not exist — nothing to pack", syncDir)
+	}
+
 	outFile := packName + ".tar.gz"
 	f, err := os.Create(outFile)
 	if err != nil {
@@ -391,7 +499,8 @@ func runPack(cmd *cobra.Command, args []string) {
 	tw := tar.NewWriter(gw)
 	defer tw.Close()
 
-	dirs := []string{dir, istioconfigsPath, xcpconfigsPath}
+	packed := 0
+	dirs := []string{envoyConfigsPath, istioconfigsPath, xcpconfigsPath}
 	for _, d := range dirs {
 		if _, err := os.Stat(d); os.IsNotExist(err) {
 			logging.Warn("Skipping %s (does not exist)", d)
@@ -417,17 +526,28 @@ func runPack(cmd *cobra.Command, args []string) {
 				return err
 			}
 			defer file.Close()
-			_, err = io.Copy(tw, file)
-			return err
+			if _, err = io.Copy(tw, file); err != nil {
+				return err
+			}
+			packed++
+			return nil
 		}); err != nil {
 			log.Fatalf("Failed to pack %s: %v", d, err)
 		}
 		logging.Info("Packed %s", d)
 	}
-	logging.Info("Archive created: %s", outFile)
+	if packed == 0 {
+		// Clean up the empty archive
+		f.Close()
+		os.Remove(outFile)
+		log.Fatalf("No files found in %s — nothing to pack", syncDir)
+	}
+	logging.Info("Archive created: %s (%d files)", outFile, packed)
 }
 
 func runUnpack(cmd *cobra.Command, args []string) {
+	ensureSyncDirs()
+
 	tarFile := args[0]
 	f, err := os.Open(tarFile)
 	if err != nil {
@@ -443,7 +563,7 @@ func runUnpack(cmd *cobra.Command, args []string) {
 	tr := tar.NewReader(gr)
 
 	// Delete existing dirs before extracting
-	dirs := []string{dir, istioconfigsPath, xcpconfigsPath}
+	dirs := []string{envoyConfigsPath, istioconfigsPath, xcpconfigsPath}
 	for _, d := range dirs {
 		if err := os.RemoveAll(d); err != nil {
 			logging.Warn("Failed to remove %s: %v", d, err)
@@ -485,5 +605,5 @@ func runUnpack(cmd *cobra.Command, args []string) {
 		}
 		out.Close()
 	}
-	logging.Info("Unpacked %s", tarFile)
+	logging.Info("Unpacked %s into %s", tarFile, dir)
 }

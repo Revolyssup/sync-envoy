@@ -20,6 +20,7 @@ type CurrentFileUpdater struct {
 	lastWritten map[string][]byte
 	mu          sync.Mutex
 	topology    *topology.File
+	showDiff    bool
 }
 
 func NewCurrentFileUpdater(basePath string) *CurrentFileUpdater {
@@ -32,6 +33,12 @@ func NewCurrentFileUpdater(basePath string) *CurrentFileUpdater {
 // WithTopology enables writing topology.md for Istio resource relationships.
 func (u *CurrentFileUpdater) WithTopology(topo *topology.File) *CurrentFileUpdater {
 	u.topology = topo
+	return u
+}
+
+// WithShowDiff enables printing unified diffs when changes are detected.
+func (u *CurrentFileUpdater) WithShowDiff(show bool) *CurrentFileUpdater {
+	u.showDiff = show
 	return u
 }
 
@@ -76,12 +83,23 @@ func (u *CurrentFileUpdater) Update(ctx context.Context, event types.Event) erro
 			logging.Debug("No diff for %s, skipping write", path)
 			return nil
 		}
-		logging.Info("Diff detected for %s:\n%s", path, d)
+		if u.showDiff {
+			logging.Info("Diff detected for %s:\n%s", path, d)
+		} else {
+			logging.Debug("Diff detected for %s:\n%s", path, d)
+		}
 	}
 
 	os.MkdirAll(filepath.Dir(path), 0755)
 	if err := os.WriteFile(path, event.NewData, 0644); err != nil {
 		return err
+	}
+
+	// Seed _desired.yaml if it doesn't exist yet, so users can edit it directly.
+	desiredPath := strings.TrimSuffix(path, "_current.yaml") + "_desired.yaml"
+	if _, err := os.Stat(desiredPath); os.IsNotExist(err) {
+		os.WriteFile(desiredPath, event.NewData, 0644)
+		logging.Debug("Seeded desired file: %s", desiredPath)
 	}
 
 	u.mu.Lock()

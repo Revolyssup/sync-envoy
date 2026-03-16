@@ -108,5 +108,39 @@ func xcpMetadata(u *unstructured.Unstructured) map[string]string {
 		data, _ := json.Marshal(labels)
 		m["labels"] = string(data)
 	}
+	if hostnames := extractGatewayHostnames(u); len(hostnames) > 0 {
+		data, _ := json.Marshal(hostnames)
+		m["hostnames"] = string(data)
+	}
 	return m
+}
+
+// extractGatewayHostnames extracts hostnames from gateway-type XCP resources.
+// These hostnames are used to discover multi-cluster ServiceEntry/DestinationRule
+// resources that follow the naming convention global-gateway-<hostname>.
+func extractGatewayHostnames(u *unstructured.Unstructured) []string {
+	switch strings.ToLower(u.GetKind()) {
+	case "ingressgateway", "gateway", "egressgateway", "tier1gateway":
+	default:
+		return nil
+	}
+
+	var hostnames []string
+	for _, section := range []string{"http", "tcp"} {
+		entries, found, err := unstructured.NestedSlice(u.Object, "spec", section)
+		if err != nil || !found {
+			continue
+		}
+		for _, entry := range entries {
+			entryMap, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			hostname, found, err := unstructured.NestedString(entryMap, "hostname")
+			if err == nil && found && hostname != "" {
+				hostnames = append(hostnames, hostname)
+			}
+		}
+	}
+	return hostnames
 }

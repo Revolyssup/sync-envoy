@@ -42,6 +42,24 @@ func TestXCPToIstioMapping_SecuritySetting(t *testing.T) {
 	}
 }
 
+func TestXCPToIstioMapping_GatewayTypes(t *testing.T) {
+	for _, kind := range []string{"ingressgateway", "gateway", "egressgateway", "tier1gateway"} {
+		kinds, ok := XCPToIstioMapping[kind]
+		if !ok {
+			t.Fatalf("%s not in mapping", kind)
+		}
+		has := make(map[string]bool)
+		for _, k := range kinds {
+			has[k] = true
+		}
+		for _, want := range []string{"ServiceEntry", "DestinationRule"} {
+			if !has[want] {
+				t.Errorf("%s mapping missing %s", kind, want)
+			}
+		}
+	}
+}
+
 func TestIstioGVRForKind(t *testing.T) {
 	gvr, ok := IstioGVRForKind("VirtualService")
 	if !ok {

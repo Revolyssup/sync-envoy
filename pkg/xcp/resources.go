@@ -45,10 +45,10 @@ var XCPToIstioMapping = map[string][]string{
 	"servicetrafficsetting":  {"DestinationRule"},
 	"securitysetting":        {"PeerAuthentication", "AuthorizationPolicy"},
 	"servicesecuritysetting": {"AuthorizationPolicy"},
-	"ingressgateway":         {"Gateway", "VirtualService", "EnvoyFilter"},
-	"gateway":                {"Gateway", "VirtualService", "EnvoyFilter"},
-	"egressgateway":          {"Gateway", "VirtualService"},
-	"tier1gateway":           {"Gateway", "VirtualService", "EnvoyFilter"},
+	"ingressgateway":         {"Gateway", "VirtualService", "EnvoyFilter", "ServiceEntry", "DestinationRule"},
+	"gateway":                {"Gateway", "VirtualService", "EnvoyFilter", "ServiceEntry", "DestinationRule"},
+	"egressgateway":          {"Gateway", "VirtualService", "ServiceEntry", "DestinationRule"},
+	"tier1gateway":           {"Gateway", "VirtualService", "EnvoyFilter", "ServiceEntry", "DestinationRule"},
 }
 
 // XCPHierarchyLabels are the label keys XCP uses to associate resources

@@ -88,7 +88,8 @@ type Event struct {
 - **Updater**: `pkg/k8s/CRUpdater`
   - Parses YAML → dynamic client Create/Update
   - Compares current cluster state, skips apply when identical
-- **Mutual exclusion**: automatically disabled (with a warning log) when `xcp-file` provider is active, since xcpconfigs/ becomes the source of truth
+  - Skips reconcile when `_desired.yaml` content matches `_current.yaml` (no user changes)
+- Both `istio-file` and `xcp-file` providers can run alongside each other
 
 ### 3. `envoy` — Envoy sidecars → JSON files
 - **Watcher**: `pkg/envoy/EnvoyWatcher` — tries three strategies:

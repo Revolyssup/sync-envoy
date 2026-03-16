@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"fmt"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -52,8 +53,8 @@ func GetResourceNameFromKind(disc discovery.DiscoveryInterface, gvk schema.Group
 	return "", fmt.Errorf("no resource found for kind %s in group %s", gvk.Kind, gvk.GroupVersion())
 }
 
-// CleanMetadata removes server-managed fields from an unstructured object
-// so it can be compared or applied cleanly.
+// CleanMetadata removes server-managed fields and XCP-reserved annotations
+// from an unstructured object so it can be compared or applied cleanly.
 func CleanMetadata(u *unstructured.Unstructured) {
 	unstructured.RemoveNestedField(u.Object, "status")
 	unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
@@ -61,4 +62,21 @@ func CleanMetadata(u *unstructured.Unstructured) {
 	unstructured.RemoveNestedField(u.Object, "metadata", "uid")
 	unstructured.RemoveNestedField(u.Object, "metadata", "creationTimestamp")
 	unstructured.RemoveNestedField(u.Object, "metadata", "generation")
+
+	// Strip XCP-reserved annotations that admission webhooks reject
+	// (e.g. edge-content-hash-mutation.xcp.tetrate.io).
+	annotations := u.GetAnnotations()
+	if len(annotations) > 0 {
+		cleaned := make(map[string]string, len(annotations))
+		for k, v := range annotations {
+			if !strings.Contains(k, "xcp.tetrate.io") {
+				cleaned[k] = v
+			}
+		}
+		if len(cleaned) == 0 {
+			unstructured.RemoveNestedField(u.Object, "metadata", "annotations")
+		} else {
+			u.SetAnnotations(cleaned)
+		}
+	}
 }
